@@ -1,0 +1,23 @@
+# Non-secret runtime settings. Secrets live in .env (see .env.example).
+storage:
+  media_dir: "./media"
+  download_media: true
+  max_media_mb: 500
+  media_concurrency: 3
+
+targets:
+  - "@durov"
+
+options:
+  backfill_on_start: true
+  backfill_limit: null         # null = no cap; integer = cap per chat
+  follow_linked_discussion: true
+  user_profile_ttl_hours: 24
+  reaction_authors: false      # fetch individual reactors (rate-limited; off by default)
+  reaction_authors_limit: 100
+
+logging:
+  level: INFO
+  dir: "./logs"
+  max_bytes: 10485760
+  backups: 5

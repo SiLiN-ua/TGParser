@@ -633,8 +633,8 @@ class Storage:
     async def avatar_lookup(self, user_id: int, photo_file_id: int | None) -> str | None:
         async with self.pool.acquire() as con:
             return await con.fetchval(
-                "SELECT local_path FROM avatar_history "
-                "WHERE user_id=$1 AND COALESCE(photo_file_id,0)=COALESCE($2,0)",
+                "SELECT local_path FROM avatar_history WHERE user_id=$1::bigint "
+                "AND COALESCE(photo_file_id, 0::bigint)=COALESCE($2::bigint, 0::bigint)",
                 user_id, photo_file_id)
 
     @_with_db_retry()
@@ -642,8 +642,8 @@ class Storage:
         async with self.pool.acquire() as con:
             await con.execute("""
                 INSERT INTO avatar_history (user_id, photo_file_id, local_path)
-                VALUES ($1,$2,$3)
-                ON CONFLICT (user_id, COALESCE(photo_file_id,0)) DO UPDATE
+                VALUES ($1::bigint, $2::bigint, $3)
+                ON CONFLICT (user_id, COALESCE(photo_file_id, 0::bigint)) DO UPDATE
                 SET local_path = COALESCE(EXCLUDED.local_path, avatar_history.local_path);
             """, user_id, photo_file_id, local_path)
 

@@ -75,19 +75,28 @@ class Collector:
     # -- public lifecycle ----------------------------------------------------
     async def start(self, targets: list[str]) -> int:
         """Resolve targets, register handlers. Return count of resolved targets.
-        failed_targets is populated for any that didn't resolve."""
+        failed_targets is populated for any that didn't resolve.
+
+        Supports: @username, numeric chat_id, canonical -100id, and private
+        invite links (t.me/+hash or t.me/joinchat/hash) via a dialog-scan
+        fallback — the user must already be a member of the private group.
+        """
         resolved_ids: set[int] = set()
         for t in targets:
+            entity = None
             try:
                 entity = await self.client.get_entity(t)
             except Exception as e:
-                log.error("cannot resolve target %s: %s", t, e)
-                self.failed_targets.append((str(t), str(e)[:200]))
-                try:
-                    await self.storage.record_error("resolve_target", None, None, None, e)
-                except Exception:
-                    pass
-                continue
+                entity = await self._resolve_via_invite_or_dialogs(t)
+                if entity is None:
+                    log.error("cannot resolve target %s: %s", t, e)
+                    self.failed_targets.append((str(t), str(e)[:200]))
+                    try:
+                        await self.storage.record_error(
+                            "resolve_target", None, None, None, e)
+                    except Exception:
+                        pass
+                    continue
             cid = canonical(entity)
             await self._save_chat(entity)
             await self.storage.init_sync_state(cid)
@@ -476,18 +485,19 @@ class Collector:
         elif msg.sender_id and msg.sender_id < 0:
             sender_chat_id = msg.sender_id
 
+        # Descriptor first (pure function): we need media_type/file_id in the
+        # messages row BEFORE anything else touches message_media (FK).
         media_type = None
         media_file_id = None
         media_path = None
-        if msg.media is not None and self.options.get("download_media", True):
-            res = await self.media_q.enqueue(cid, msg)
-            if res:
-                media_type, media_file_id, media_path = res
-        elif msg.media is not None:
-            d = media_descriptor_or_none(msg)
-            if d:
-                media_type = d["media_type"]
-                media_file_id = d["file_id"]
+        media_desc = None
+        if msg.media is not None:
+            media_desc = media_descriptor_or_none(msg)
+            if media_desc:
+                media_type = media_desc["media_type"]
+                # For non-downloadable we scope the file_id below after upsert.
+                if media_desc.get("is_downloadable", True):
+                    media_file_id = media_desc["file_id"]
 
         fwd_user, fwd_chat, fwd_name, fwd_msg_id, fwd_date, fwd_post = (None,) * 6
         if isinstance(msg.fwd_from, MessageFwdHeader):
@@ -596,6 +606,27 @@ class Collector:
             if self._fetch_reaction_authors:
                 self._spawn_bg(self._safe_fetch_reaction_authors(cid, msg.id),
                                name=f"react_auth:{cid}:{msg.id}")
+
+        # Media enqueue AFTER message upsert so FK(message_media -> messages)
+        # has a parent row to point at.
+        if media_desc is not None and self.options.get("download_media", True):
+            try:
+                res = await self.media_q.enqueue(cid, msg)
+                if res:
+                    _, mfid, mpath = res
+                    # For metadata_only (scoped id) or already-cached file,
+                    # record the final file_id on the message row.
+                    if mfid and mfid != media_file_id:
+                        async with self.storage.pool.acquire() as con:
+                            await con.execute(
+                                "UPDATE messages SET media_file_id=$3, "
+                                "media_path=COALESCE(NULLIF($4,''),media_path) "
+                                "WHERE chat_id=$1 AND message_id=$2",
+                                cid, msg.id, mfid, mpath or "")
+                        await self.storage.link_message_media(cid, msg.id, mfid)
+            except Exception as e:
+                log.warning("enqueue media (%s,%s) soft-fail: %s",
+                            cid, msg.id, e)
 
     # -- live reactions ------------------------------------------------------
     async def _handle_reactions_update(self, update, cid: int):
@@ -959,6 +990,37 @@ class Collector:
             await self.client.catch_up()
         except Exception as e:
             log.warning("catch_up failed: %s", e)
+
+    async def _resolve_via_invite_or_dialogs(self, target: str):
+        """Fallback for private invite links: `t.me/+hash` or `t.me/joinchat/h`.
+
+        Strategy:
+          1. If the link carries an invite hash, call CheckChatInviteRequest;
+             when the user is a member Telegram returns `ChatInviteAlready`
+             which wraps the Chat.
+          2. Otherwise scan iter_dialogs() and match by a trailing identifier.
+        """
+        import re
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.types import ChatInviteAlready, ChatInvitePeek
+
+        m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", target or "")
+        if m:
+            invite_hash = m.group(1)
+            try:
+                res = await self.client(CheckChatInviteRequest(hash=invite_hash))
+                if isinstance(res, (ChatInviteAlready, ChatInvitePeek)):
+                    return res.chat
+            except Exception as e:
+                log.info("CheckChatInviteRequest(%s) failed: %s", invite_hash, e)
+        # Final fallback: find in dialogs by matching title substring from URL
+        try:
+            async for d in self.client.iter_dialogs():
+                if d.entity and target and str(getattr(d.entity, "id", "")) in target:
+                    return d.entity
+        except Exception:
+            pass
+        return None
 
     # -- background tasks ----------------------------------------------------
     def _spawn_bg(self, coro, name: str):

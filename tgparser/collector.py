@@ -775,6 +775,18 @@ class Collector:
         if sender_user_id and sender_entity is not None and hasattr(sender_entity, "id"):
             await self._store_sender_entity(
                 sender_entity, cid, msg.id, source_type="message_sender")
+        elif sender_user_id:
+            # No cached entity yet (common for historical backfill). Still
+            # record the observation so we can prove per-chat coverage, and
+            # queue enrichment via the usual path.
+            try:
+                await self.storage.record_user_observation(
+                    user_id=sender_user_id, chat_id=cid, message_id=msg.id,
+                    source_type="message_sender", entity_quality="min",
+                    username_at_time=None, display_name_at_time=None,
+                    access_hash_present=False)
+            except Exception:
+                pass
         if sender_user_id:
             self._spawn_bg(
                 self._safe_ensure_user(sender_user_id, sender=sender_entity,

@@ -286,6 +286,21 @@ class MediaQueue:
                     idx, pid=pid, current_file_id=file_id)
             except Exception:
                 pass
+            # v7: background heartbeat-ticker while download is in progress
+            stop_hb = asyncio.Event()
+            async def _hb_ticker():
+                while not stop_hb.is_set():
+                    try:
+                        await asyncio.wait_for(stop_hb.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        pass
+                    if not stop_hb.is_set():
+                        try:
+                            await self.storage.worker_heartbeat(
+                                idx, pid=pid, current_file_id=file_id)
+                        except Exception:
+                            pass
+            hb_task = asyncio.create_task(_hb_ticker())
             try:
                 await self._download(item)
                 try:
@@ -332,6 +347,11 @@ class MediaQueue:
                 except Exception:
                     pass
             finally:
+                try:
+                    stop_hb.set()
+                    await hb_task
+                except Exception:
+                    pass
                 await self._release_inflight(file_id)
                 self.queue.task_done()
 

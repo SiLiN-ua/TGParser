@@ -779,16 +779,23 @@ def scrub_or_die(path: Path):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--version", default="v5")
+    args = ap.parse_args()
+
     snap = asyncio.run(collect())
+    snap["report_version"] = args.version
     reports_dir = HERE / "reports"
     reports_dir.mkdir(exist_ok=True)
 
-    json_path = reports_dir / "TGParser_v4_1_report.json"
+    stem = f"TGParser_{args.version}_report"
+    json_path = reports_dir / f"{stem}.json"
     json_path.write_text(json.dumps(snap, default=str, ensure_ascii=False, indent=2),
                          encoding="utf-8")
     scrub_or_die(json_path)
 
-    html_path = reports_dir / "TGParser_v4_1_report.html"
+    html_path = reports_dir / f"{stem}.html"
     html_path.write_text(render_html(snap), encoding="utf-8")
     scrub_or_die(html_path)
 

@@ -759,23 +759,27 @@ class Collector:
             sender_entity = await msg.get_sender()
         except Exception:
             sender_entity = None
+
         if msg.from_id is not None:
             if is_user_peer(msg.from_id):
                 sender_user_id = msg.from_id.user_id
-                self._spawn_bg(
-                    self._safe_ensure_user(sender_user_id, sender=sender_entity,
-                                           hint_chat=cid, hint_msg=msg.id),
-                    name=f"user:{sender_user_id}")
             elif is_channel_peer(msg.from_id):
                 sender_chat_id = _peer_id_signed(msg.from_id)
         elif msg.sender_id and msg.sender_id > 0:
             sender_user_id = msg.sender_id
+        elif msg.sender_id and msg.sender_id < 0:
+            sender_chat_id = msg.sender_id
+
+        # v7: persist the sender entity immediately (even if `min`), record
+        # an observation, then spawn full-profile enrichment if needed.
+        if sender_user_id and sender_entity is not None and hasattr(sender_entity, "id"):
+            await self._store_sender_entity(
+                sender_entity, cid, msg.id, source_type="message_sender")
+        if sender_user_id:
             self._spawn_bg(
                 self._safe_ensure_user(sender_user_id, sender=sender_entity,
                                        hint_chat=cid, hint_msg=msg.id),
                 name=f"user:{sender_user_id}")
-        elif msg.sender_id and msg.sender_id < 0:
-            sender_chat_id = msg.sender_id
 
         # Descriptor first (pure function): we need media_type/file_id in the
         # messages row BEFORE anything else touches message_media (FK).
@@ -1151,6 +1155,67 @@ class Collector:
             pass
         return "member"
 
+    # -- v7: entity ingestion from messages ---------------------------------
+    async def _store_sender_entity(self, ent, chat_id: int, msg_id: int,
+                                   source_type: str):
+        """Save a Telethon User entity (even `min`) so we later have the
+        access_hash required to build InputPeerUser, plus a per-chat
+        observation row."""
+        from telethon.tl.types import User as TUser
+        if not isinstance(ent, TUser):
+            return
+        is_min = bool(getattr(ent, "min", False))
+        quality = "min" if is_min else "normal"
+        access_hash = getattr(ent, "access_hash", None)
+        data = {
+            "id": ent.id,
+            "access_hash": access_hash if access_hash else None,
+            "username": getattr(ent, "username", None),
+            "first_name": getattr(ent, "first_name", None),
+            "last_name": getattr(ent, "last_name", None),
+            "phone": getattr(ent, "phone", None),
+            "is_bot": getattr(ent, "bot", None),
+            "is_premium": getattr(ent, "premium", None),
+            "is_scam": getattr(ent, "scam", None),
+            "is_fake": getattr(ent, "fake", None),
+            "is_verified": getattr(ent, "verified", None),
+            "is_deleted": getattr(ent, "deleted", None),
+            "is_contact": getattr(ent, "contact", None),
+            "is_mutual_contact": getattr(ent, "mutual_contact", None),
+            "is_close_friend": getattr(ent, "close_friend", None),
+            "is_min": is_min,
+            "lang_code": getattr(ent, "lang_code", None),
+            "photo_dc": getattr(getattr(ent, "photo", None), "dc_id", None),
+            "photo_file_id": getattr(getattr(ent, "photo", None), "photo_id", None),
+            "entity_source": source_type,
+            "entity_quality": quality,
+            "source_chat_id": chat_id,
+            "source_message_id": msg_id,
+        }
+        try:
+            data["raw"] = ent.to_dict()
+        except Exception:
+            data["raw"] = None
+        try:
+            await self.storage.upsert_user_from_entity(data)
+        except Exception as e:
+            log.info("store_sender_entity soft-fail uid=%s: %s", ent.id, e)
+            return
+        # Observation row (no text, no raw bio/username values beyond what
+        # already lives in users)
+        try:
+            display = " ".join(x for x in [data.get("first_name"),
+                                           data.get("last_name")] if x) or None
+            await self.storage.record_user_observation(
+                user_id=ent.id, chat_id=chat_id, message_id=msg_id,
+                source_type=source_type, entity_quality=quality,
+                username_at_time=data.get("username"),
+                display_name_at_time=display,
+                access_hash_present=bool(access_hash),
+                raw_meta=None)
+        except Exception:
+            pass
+
     # -- users / avatars -----------------------------------------------------
     async def _safe_ensure_user(self, user_id: int, sender=None,
                                 hint_chat: int | None = None,
@@ -1184,14 +1249,28 @@ class Collector:
             needs = await self.storage.user_needs_refresh(user_id, self._user_profile_ttl)
             if not needs:
                 return
-            # v5: prefer resolving via the message sender when available —
-            # that carries the access_hash Telegram needs.
-            peer = user_id
+            # v7: prefer the sender entity (carries access_hash), otherwise
+            # try to build InputPeerUser from the access_hash we already
+            # persisted, otherwise fall back to Telethon's own resolve.
+            peer = None
             if sender is not None:
                 try:
                     peer = await self.client.get_input_entity(sender)
                 except Exception:
-                    peer = user_id
+                    peer = None
+            if peer is None:
+                ah = await self.storage.user_access_hash(user_id)
+                if ah is not None:
+                    from telethon.tl.types import InputPeerUser
+                    peer = InputPeerUser(user_id=user_id, access_hash=ah)
+            if peer is None:
+                try:
+                    peer = await self.client.get_input_entity(user_id)
+                except Exception:
+                    peer = None
+            if peer is None:
+                # No InputPeer → cannot call GetFullUser. Queue + bail.
+                raise ValueError(f"no InputPeer for {user_id}")
             try:
                 full = await self.client(GetFullUserRequest(peer))
             except (errors.UserIdInvalidError, errors.PeerIdInvalidError):
@@ -1208,8 +1287,9 @@ class Collector:
                 raw = user.to_dict()
             except Exception:
                 raw = {}
-            await self.storage.upsert_user({
+            await self.storage.upsert_user_from_entity({
                 "id": user.id,
+                "access_hash": getattr(user, "access_hash", None),
                 "username": user.username,
                 "first_name": user.first_name,
                 "last_name": user.last_name,
@@ -1221,10 +1301,16 @@ class Collector:
                 "is_fake": getattr(user, "fake", False),
                 "is_verified": getattr(user, "verified", False),
                 "is_deleted": getattr(user, "deleted", False),
+                "is_contact": getattr(user, "contact", None),
+                "is_mutual_contact": getattr(user, "mutual_contact", None),
+                "is_close_friend": getattr(user, "close_friend", None),
+                "is_min": bool(getattr(user, "min", False)),
                 "lang_code": getattr(user, "lang_code", None),
                 "photo_path": photo_path,
                 "photo_dc": getattr(getattr(user, "photo", None), "dc_id", None),
                 "photo_file_id": photo_fid,
+                "entity_source": "full",
+                "entity_quality": "full",
                 "raw": raw,
                 "full_fetched_at": datetime.now(timezone.utc),
             })

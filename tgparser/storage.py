@@ -1017,6 +1017,180 @@ class Storage:
                 "attempts=attempts+1 WHERE file_id=$1",
                 file_id, reason[:300])
 
+    # --- v7: user identity enrichment --------------------------------------
+    _QUALITY_RANK = {"min": 1, "normal": 2, "full": 3}
+
+    @_with_db_retry()
+    async def upsert_user_from_entity(self, data: dict, record_history: bool = True):
+        """Store a user row from a Telethon-style entity dict.
+
+        Downgrade protection: if the new quality is lower than what we have
+        (e.g. a `min` entity arrives after we already stored a `full` one),
+        we only refresh timestamps + access_hash, never overwrite
+        username/name/bio with weaker data.
+        """
+        uid = data["id"]
+        new_q = data.get("entity_quality") or "normal"
+        new_rank = self._QUALITY_RANK.get(new_q, 1)
+        async with self.pool.acquire() as con:
+            prev = await con.fetchrow(
+                "SELECT username, first_name, last_name, bio, photo_file_id, "
+                "entity_quality, access_hash FROM users WHERE id=$1::bigint", uid)
+            prev_q = (prev["entity_quality"] if prev else None) or "min"
+            prev_rank = self._QUALITY_RANK.get(prev_q, 0)
+
+            if prev and new_rank < prev_rank:
+                # downgrade: refresh only technical fields
+                await con.execute("""
+                    UPDATE users SET
+                        access_hash = COALESCE($2::bigint, access_hash),
+                        access_hash_updated_at = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE access_hash_updated_at END,
+                        last_seen = NOW(),
+                        last_updated = NOW()
+                     WHERE id = $1::bigint
+                """, uid, data.get("access_hash"))
+                return
+
+            # upsert with new quality taking over
+            await con.execute("""
+                INSERT INTO users (
+                    id, access_hash, access_hash_updated_at,
+                    username, first_name, last_name, phone, bio,
+                    is_bot, is_premium, is_scam, is_fake, is_verified, is_deleted,
+                    is_contact, is_mutual_contact, is_close_friend, is_min,
+                    lang_code, photo_path, photo_dc, photo_file_id,
+                    entity_source, entity_quality,
+                    raw, full_fetched_at, first_seen, last_seen, last_updated)
+                VALUES ($1::bigint, $2::bigint,
+                    CASE WHEN $2 IS NOT NULL THEN NOW() END,
+                    $3,$4,$5,$6,$7,
+                    $8,$9,$10,$11,$12,$13,
+                    $14,$15,$16,$17,
+                    $18,$19,$20,$21::bigint,
+                    $22,$23,
+                    $24::jsonb,$25,NOW(),NOW(),NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    access_hash = COALESCE(EXCLUDED.access_hash, users.access_hash),
+                    access_hash_updated_at = CASE
+                        WHEN EXCLUDED.access_hash IS NOT NULL
+                             AND EXCLUDED.access_hash IS DISTINCT FROM users.access_hash
+                        THEN NOW()
+                        ELSE users.access_hash_updated_at END,
+                    username   = COALESCE(EXCLUDED.username,  users.username),
+                    first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                    last_name  = COALESCE(EXCLUDED.last_name,  users.last_name),
+                    phone      = COALESCE(EXCLUDED.phone,     users.phone),
+                    bio        = COALESCE(EXCLUDED.bio,       users.bio),
+                    is_bot     = COALESCE(EXCLUDED.is_bot,    users.is_bot),
+                    is_premium = COALESCE(EXCLUDED.is_premium,users.is_premium),
+                    is_scam    = COALESCE(EXCLUDED.is_scam,   users.is_scam),
+                    is_fake    = COALESCE(EXCLUDED.is_fake,   users.is_fake),
+                    is_verified= COALESCE(EXCLUDED.is_verified,users.is_verified),
+                    is_deleted = COALESCE(EXCLUDED.is_deleted,users.is_deleted),
+                    is_contact = COALESCE(EXCLUDED.is_contact,users.is_contact),
+                    is_mutual_contact = COALESCE(EXCLUDED.is_mutual_contact, users.is_mutual_contact),
+                    is_close_friend   = COALESCE(EXCLUDED.is_close_friend,   users.is_close_friend),
+                    is_min     = COALESCE(EXCLUDED.is_min,    users.is_min),
+                    lang_code  = COALESCE(EXCLUDED.lang_code, users.lang_code),
+                    photo_path     = COALESCE(EXCLUDED.photo_path,     users.photo_path),
+                    photo_dc       = COALESCE(EXCLUDED.photo_dc,       users.photo_dc),
+                    photo_file_id  = COALESCE(EXCLUDED.photo_file_id,  users.photo_file_id),
+                    entity_source  = EXCLUDED.entity_source,
+                    entity_quality = EXCLUDED.entity_quality,
+                    raw = EXCLUDED.raw,
+                    full_fetched_at = COALESCE(EXCLUDED.full_fetched_at, users.full_fetched_at),
+                    last_seen = NOW(),
+                    last_updated = NOW();
+            """, uid, data.get("access_hash"),
+                 data.get("username"), data.get("first_name"), data.get("last_name"),
+                 data.get("phone"), data.get("bio"),
+                 data.get("is_bot"), data.get("is_premium"), data.get("is_scam"),
+                 data.get("is_fake"), data.get("is_verified"), data.get("is_deleted"),
+                 data.get("is_contact"), data.get("is_mutual_contact"),
+                 data.get("is_close_friend"), data.get("is_min"),
+                 data.get("lang_code"), data.get("photo_path"),
+                 data.get("photo_dc"), data.get("photo_file_id"),
+                 data.get("entity_source"), new_q,
+                 _j(data.get("raw")), data.get("full_fetched_at"))
+
+            if record_history and prev is not None:
+                for field in ("username", "first_name", "last_name", "bio",
+                              "photo_file_id"):
+                    old = prev[field]
+                    new = data.get(field)
+                    if new is None:
+                        continue
+                    if (old or "") != (str(new) if new is not None else ""):
+                        await con.execute(
+                            "INSERT INTO user_profile_history "
+                            "(user_id, field, old_value, new_value, source_chat_id, source_message_id) "
+                            "VALUES ($1::bigint,$2,$3,$4,$5,$6)",
+                            uid, field,
+                            None if old is None else str(old),
+                            None if new is None else str(new),
+                            data.get("source_chat_id"),
+                            data.get("source_message_id"))
+
+    @_with_db_retry()
+    async def record_user_observation(self, user_id: int, chat_id: int,
+                                      message_id: int | None,
+                                      source_type: str, entity_quality: str,
+                                      username_at_time: str | None,
+                                      display_name_at_time: str | None,
+                                      access_hash_present: bool,
+                                      raw_meta: dict | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO user_observations
+                  (user_id, chat_id, message_id, source_type, entity_quality,
+                   username_at_time, display_name_at_time, access_hash_present,
+                   raw_meta)
+                VALUES ($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+            """, user_id, chat_id, message_id, source_type, entity_quality,
+                 username_at_time, display_name_at_time, access_hash_present,
+                 _j(raw_meta))
+
+    @_with_db_retry()
+    async def user_access_hash(self, user_id: int) -> int | None:
+        async with self.pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT access_hash FROM users WHERE id=$1::bigint", user_id)
+
+    @_with_db_retry()
+    async def users_enrichment_stats(self) -> dict:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("""
+                SELECT COUNT(*) AS total,
+                       COUNT(access_hash) AS with_access_hash,
+                       COUNT(username) AS with_username,
+                       COUNT(first_name) AS with_first_name,
+                       COUNT(last_name) AS with_last_name,
+                       COUNT(bio) AS with_bio,
+                       COUNT(phone) AS with_phone,
+                       COUNT(photo_file_id) AS with_avatar,
+                       COUNT(*) FILTER (WHERE entity_quality='min') AS q_min,
+                       COUNT(*) FILTER (WHERE entity_quality='normal') AS q_normal,
+                       COUNT(*) FILTER (WHERE entity_quality='full') AS q_full,
+                       COUNT(*) FILTER (WHERE full_fetched_at IS NOT NULL) AS with_full_fetch
+                FROM users WHERE id > 0
+            """)
+            return dict(row)
+
+    @_with_db_retry()
+    async def users_multi_chat(self) -> int:
+        async with self.pool.acquire() as con:
+            return await con.fetchval("""
+                SELECT COUNT(*) FROM (
+                    SELECT user_id FROM user_observations
+                    GROUP BY user_id HAVING COUNT(DISTINCT chat_id) > 1
+                ) x
+            """)
+
+    @_with_db_retry()
+    async def users_negative_id_count(self) -> int:
+        async with self.pool.acquire() as con:
+            return await con.fetchval("SELECT COUNT(*) FROM users WHERE id < 0")
+
     @_with_db_retry()
     async def media_needs_refresh(self, limit: int = 100) -> list:
         async with self.pool.acquire() as con:

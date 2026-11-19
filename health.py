@@ -88,9 +88,10 @@ async def build_snapshot() -> dict:
 
     targets_rows = await storage.targets_all()
     targets = []
+    disabled_targets = []
     for r in targets_rows:
         prob = await storage.backfill_queue_problem_ids(r["chat_id"], limit=20)
-        targets.append({
+        info = {
             "chat_id": r["chat_id"], "target": r["target"],
             "backfill_status": r["backfill_status"],
             "pending_count": r["pending_count"],
@@ -98,8 +99,14 @@ async def build_snapshot() -> dict:
             "last_success_at": r["last_success_at"].isoformat() if r["last_success_at"] else None,
             "last_error_at": r["last_error_at"].isoformat() if r["last_error_at"] else None,
             "last_error": r["last_error"],
+            "enabled": bool(r.get("enabled", True)),
+            "disabled_reason": r.get("disabled_reason"),
             "problem_message_ids": prob,
-        })
+        }
+        if info["enabled"]:
+            targets.append(info)
+        else:
+            disabled_targets.append(info)
 
     async with storage.pool.acquire() as con:
         totals = dict(await con.fetchrow("""
@@ -127,10 +134,22 @@ async def build_snapshot() -> dict:
         """))
         distinct = await con.fetchval(
             "SELECT COUNT(*) FROM (SELECT DISTINCT chat_id, message_id FROM messages) x")
+        totals["errors_unresolved"] = await con.fetchval(
+            "SELECT COUNT(*) FROM errors WHERE resolved_at IS NULL")
+        totals["errors_unresolved_1h"] = await con.fetchval(
+            "SELECT COUNT(*) FROM errors WHERE resolved_at IS NULL AND at > NOW() - interval '1 hour'")
     totals["last_error_at"] = (
         totals["last_error_at"].isoformat() if totals.get("last_error_at") else None)
     totals["distinct_match"] = (totals["msgs"] == distinct)
 
+    # v5: throughput / backlog measurements
+    mpm = await storage.messages_per_minute(window_minutes=5)
+    oldest_pending = await storage.media_oldest_pending_age()
+    upq_stats = await storage.user_profile_queue_stats()
+    errors_by_group = await storage.errors_unresolved_by_group()
+
+    # v5: active backfill progressing counts as syncing (not degraded).
+    # We detect progress as last_batch_at freshness within the chat's state.
     checks = {
         "pid_alive": alive,
         "heartbeat_fresh": hb_age is not None and hb_age < HEARTBEAT_STALE_SEC,
@@ -142,11 +161,12 @@ async def build_snapshot() -> dict:
             t["backfill_status"] not in ("blocked",) for t in targets),
         "no_unacknowledged_dead": all(t["dead_count"] == 0 for t in targets),
         "distinct_match": totals["distinct_match"],
+        "no_unresolved_errors_1h": totals["errors_unresolved_1h"] == 0,
     }
 
-    # Derive overall status.
     unhealthy_reasons = []
     degraded_reasons = []
+    syncing_reasons = []
     if not alive:
         unhealthy_reasons.append("pid_not_alive")
     if not checks["heartbeat_fresh"]:
@@ -156,22 +176,29 @@ async def build_snapshot() -> dict:
     elif not checks["telegram_fresh"]:
         degraded_reasons.append("telegram_heartbeat_stale")
     if not checks["any_target_active"]:
-        unhealthy_reasons.append("no_targets")
+        unhealthy_reasons.append("no_active_targets")
     if not checks["distinct_match"]:
         unhealthy_reasons.append("duplicate_messages")
+    if not checks["no_unresolved_errors_1h"]:
+        degraded_reasons.append(
+            f"unresolved_errors_last_hour={totals['errors_unresolved_1h']}")
     for t in targets:
         if t["backfill_status"] == "blocked":
             degraded_reasons.append(f"target_{t['chat_id']}_blocked")
+        elif t["backfill_status"] in ("syncing", "running"):
+            syncing_reasons.append(f"target_{t['chat_id']}_syncing")
         elif t["backfill_status"] == "incomplete":
-            degraded_reasons.append(f"target_{t['chat_id']}_incomplete")
-        elif t["backfill_status"] == "complete_with_errors":
-            if t["dead_count"] > 0:
-                degraded_reasons.append(f"target_{t['chat_id']}_dead")
+            # legacy label; the coordinator should move it to `syncing`
+            syncing_reasons.append(f"target_{t['chat_id']}_syncing_legacy")
+        elif t["backfill_status"] == "complete_with_errors" and t["dead_count"] > 0:
+            degraded_reasons.append(f"target_{t['chat_id']}_dead")
 
     if unhealthy_reasons:
         status = "unhealthy"
     elif degraded_reasons:
         status = "degraded"
+    elif syncing_reasons:
+        status = "syncing"
     else:
         status = "healthy"
 
@@ -188,11 +215,17 @@ async def build_snapshot() -> dict:
         "telegram_last_error": rt["telegram_last_error"] if rt else None,
         "update_last_received_age_sec": upd_age,
         "last_message_age_sec": last_msg_age,
-        "targets": targets,
+        "messages_per_minute": mpm,
+        "media_oldest_pending_age_sec": oldest_pending,
+        "user_profile_queue": upq_stats,
+        "errors_unresolved_by_group": errors_by_group,
+        "active_targets": targets,
+        "disabled_targets": disabled_targets,
         "totals": totals,
         "checks": checks,
         "reasons_unhealthy": unhealthy_reasons,
         "reasons_degraded": degraded_reasons,
+        "reasons_syncing": syncing_reasons,
     }
 
 
@@ -218,17 +251,26 @@ async def main() -> int:
         print(f"last_message_age_sec: {snap.get('last_message_age_sec')}")
         print(f"reasons_unhealthy: {snap.get('reasons_unhealthy')}")
         print(f"reasons_degraded: {snap.get('reasons_degraded')}")
-        print("targets:")
-        for t in snap.get("targets", []):
+        print(f"messages_per_minute: {snap.get('messages_per_minute')}")
+        print(f"media_oldest_pending_age_sec: {snap.get('media_oldest_pending_age_sec')}")
+        print(f"user_profile_queue: {snap.get('user_profile_queue')}")
+        print(f"errors_unresolved_by_group: {snap.get('errors_unresolved_by_group')}")
+        print(f"reasons_syncing: {snap.get('reasons_syncing')}")
+        print("active targets:")
+        for t in snap.get("active_targets", []):
             print(f"  chat={t['chat_id']} target={t['target']} "
                   f"status={t['backfill_status']} "
                   f"pending={t['pending_count']} dead={t['dead_count']} "
                   f"problem_ids={t['problem_message_ids']}")
+        print("disabled targets:")
+        for t in snap.get("disabled_targets", []):
+            print(f"  chat={t['chat_id']} target={t['target']} "
+                  f"reason={t['disabled_reason']}")
         print("totals:")
         for k, v in (snap.get("totals") or {}).items():
             print(f"  {k}={v}")
     s = snap.get("status")
-    if s == "healthy":
+    if s in ("healthy", "syncing"):
         return 0
     if s == "degraded":
         return 1

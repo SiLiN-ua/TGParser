@@ -427,7 +427,7 @@ class Storage:
                                   mark_complete: bool | None = None):
         """Set truthful backfill_status. Never marks `backfill_complete` TRUE
         unless `mark_complete=True` AND status='complete'."""
-        assert status in {"running", "complete", "incomplete",
+        assert status in {"running", "syncing", "complete", "incomplete",
                           "blocked", "complete_with_errors"}
         async with self.pool.acquire() as con:
             if mark_complete and status == "complete":
@@ -754,8 +754,134 @@ class Storage:
         async with self.pool.acquire() as con:
             return await con.fetch(
                 "SELECT chat_id, target, backfill_status, last_success_at, "
-                "last_error_at, last_error, pending_count, dead_count "
+                "last_error_at, last_error, pending_count, dead_count, "
+                "enabled, disabled_at, disabled_reason "
                 "FROM target_state ORDER BY chat_id")
+
+    @_with_db_retry()
+    async def targets_active(self) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as con:
+            return await con.fetch(
+                "SELECT chat_id, target, backfill_status, last_success_at, "
+                "last_error_at, last_error, pending_count, dead_count "
+                "FROM target_state WHERE enabled=TRUE ORDER BY chat_id")
+
+    @_with_db_retry()
+    async def target_disable(self, chat_id: int, reason: str = "removed_from_config"):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE target_state SET enabled=FALSE, disabled_at=NOW(), "
+                "disabled_reason=$2, updated_at=NOW() WHERE chat_id=$1",
+                chat_id, reason)
+
+    @_with_db_retry()
+    async def target_enable(self, chat_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE target_state SET enabled=TRUE, disabled_at=NULL, "
+                "disabled_reason=NULL, updated_at=NOW() WHERE chat_id=$1",
+                chat_id)
+
+    @_with_db_retry()
+    async def record_batch_progress(self, chat_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE sync_state SET last_batch_at=NOW(), "
+                "batches_completed = batches_completed + 1 WHERE chat_id=$1",
+                chat_id)
+
+    # --- v5: durable user profile retry queue --------------------------------
+    @_with_db_retry()
+    async def user_profile_queue_upsert(self, user_id: int, error: str,
+                                        hint_chat_id: int | None = None,
+                                        hint_message_id: int | None = None,
+                                        retry_in_minutes: int = 10):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO user_profile_queue
+                    (user_id, attempts, last_error, last_attempt_at,
+                     next_retry_at, hint_chat_id, hint_message_id)
+                VALUES ($1::bigint, 1, $2, NOW(),
+                        NOW() + ($3 || ' minutes')::interval, $4, $5)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    attempts = user_profile_queue.attempts + 1,
+                    last_error = EXCLUDED.last_error,
+                    last_attempt_at = NOW(),
+                    next_retry_at = NOW() + ($3 || ' minutes')::interval,
+                    hint_chat_id = COALESCE(user_profile_queue.hint_chat_id, EXCLUDED.hint_chat_id),
+                    hint_message_id = COALESCE(user_profile_queue.hint_message_id, EXCLUDED.hint_message_id);
+            """, user_id, (error or "")[:500], str(retry_in_minutes),
+                 hint_chat_id, hint_message_id)
+
+    @_with_db_retry()
+    async def user_profile_queue_mark_done(self, user_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE user_profile_queue SET status='done', last_attempt_at=NOW() "
+                "WHERE user_id=$1::bigint",
+                user_id)
+
+    @_with_db_retry()
+    async def user_profile_queue_mark_dead(self, user_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE user_profile_queue SET status='dead', last_attempt_at=NOW() "
+                "WHERE user_id=$1::bigint",
+                user_id)
+
+    @_with_db_retry()
+    async def user_profile_queue_pending(self, limit: int = 100,
+                                         max_attempts: int = 5):
+        async with self.pool.acquire() as con:
+            return await con.fetch(
+                "SELECT user_id, attempts, hint_chat_id, hint_message_id "
+                "FROM user_profile_queue "
+                "WHERE status='pending' AND attempts < $2 "
+                "AND (next_retry_at IS NULL OR next_retry_at <= NOW()) "
+                "ORDER BY first_seen LIMIT $1",
+                limit, max_attempts)
+
+    @_with_db_retry()
+    async def user_profile_queue_stats(self) -> dict:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT status, count(*) FROM user_profile_queue GROUP BY status")
+            return {r["status"]: r["count"] for r in rows}
+
+    # --- v5: error audit ----------------------------------------------------
+    @_with_db_retry()
+    async def errors_unresolved_by_group(self) -> list[dict]:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT COALESCE(error_group, kind) AS group, COUNT(*) AS n "
+                "FROM errors WHERE resolved_at IS NULL "
+                "GROUP BY 1 ORDER BY 2 DESC")
+            return [dict(r) for r in rows]
+
+    @_with_db_retry()
+    async def errors_resolve_group(self, group: str, resolution: str):
+        async with self.pool.acquire() as con:
+            return await con.execute(
+                "UPDATE errors SET resolved_at=NOW(), resolution=$2 "
+                "WHERE error_group=$1 AND resolved_at IS NULL",
+                group, resolution)
+
+    # --- v5: message throughput & batch metrics -----------------------------
+    @_with_db_retry()
+    async def messages_per_minute(self, window_minutes: int = 5) -> float:
+        async with self.pool.acquire() as con:
+            n = await con.fetchval(
+                f"SELECT COUNT(*) FROM messages WHERE collected_at > NOW() - "
+                f"interval '{int(window_minutes)} minutes'")
+            return float(n) / max(window_minutes, 1)
+
+    @_with_db_retry()
+    async def media_oldest_pending_age(self) -> int | None:
+        async with self.pool.acquire() as con:
+            row = await con.fetchval(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(first_seen)))::int "
+                "FROM media WHERE status IN ('pending','failed')")
+            return row
 
     # --- v4: telegram heartbeat ---------------------------------------------
     @_with_db_retry()

@@ -17,3 +17,5 @@ tool-results/
 healthwatch_out.json
 .claude/
 out.json
+reports/*.html
+reports/*.json

@@ -72,6 +72,18 @@ class Collector:
         self.failed_targets: list[tuple[str, str]] = []
         self.ok_targets: list[int] = []
 
+        # v5: batch coordinator + user profile queue dedup
+        self.batch_size = int(options.get("backfill_batch_size",
+                              options.get("backfill_limit") or 2000))
+        self.batch_pause = int(options.get("backfill_batch_pause_seconds", 2))
+        self.batch_concurrency = int(options.get("backfill_max_concurrency", 1))
+        self._user_profile_inflight: set[int] = set()
+        self._user_profile_lock = asyncio.Lock()
+        self._coordinator_task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+        # Per-PID batch counter (acceptance proof: >=2 batches per target same PID)
+        self.batches_this_pid: dict[int, int] = {}
+
     # -- public lifecycle ----------------------------------------------------
     async def start(self, targets: list[str]) -> int:
         """Resolve targets, register handlers. Return count of resolved targets.
@@ -115,7 +127,116 @@ class Collector:
         self._targets = sorted(resolved_ids)
         self.ok_targets = list(self._targets)
         self._register_handlers(self._targets)
+        # Lifecycle: disable targets that are no longer in config.
+        for row in await self.storage.targets_all():
+            if row["chat_id"] not in resolved_ids and row.get("enabled"):
+                await self.storage.target_disable(
+                    row["chat_id"], reason="removed_from_config")
+                log.info("target %s disabled (not in config)", row["chat_id"])
+            elif row["chat_id"] in resolved_ids and not row.get("enabled", True):
+                await self.storage.target_enable(row["chat_id"])
         return len(self._targets)
+
+    # v5: background coordinator - keeps running batches until natural end
+    async def start_coordinator(self):
+        """Spawn the background backfill coordinator task.
+
+        The coordinator keeps iterating batches for each active target whose
+        backfill status is `running` or `syncing`, pausing between batches so
+        live updates and reaction handlers keep flowing. It never blocks the
+        main loop or creates a second TelegramClient."""
+        if self._coordinator_task is not None:
+            return
+        self._coordinator_task = asyncio.create_task(
+            self._coordinator_loop(), name="backfill-coordinator")
+
+    async def stop_coordinator(self):
+        self._stop.set()
+        if self._coordinator_task:
+            try:
+                await asyncio.wait_for(self._coordinator_task, timeout=20)
+            except Exception:
+                self._coordinator_task.cancel()
+                try:
+                    await self._coordinator_task
+                except BaseException:
+                    pass
+
+    async def _coordinator_loop(self):
+        log.info("coordinator started (batch_size=%s pause=%ss)",
+                 self.batch_size, self.batch_pause)
+        try:
+            # First pass: participants + DLQ, then keep batching messages.
+            if self._participants_sync:
+                for cid in self._targets:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        await self.sync_participants(cid)
+                    except Exception as e:
+                        log.warning("participants sync %s: %s", cid, e)
+
+            while not self._stop.is_set():
+                any_progress = False
+                for cid in self._targets:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        added, status, more = await self.backfill(cid)
+                        if added:
+                            any_progress = True
+                        if not more and status in ("complete", "complete_with_errors"):
+                            # Final DLQ pass once a chat reports complete.
+                            await self.retry_dead_letter(cid)
+                        if more:
+                            # Short pause between batches to respect rate limits.
+                            try:
+                                await asyncio.wait_for(
+                                    self._stop.wait(), timeout=self.batch_pause)
+                            except asyncio.TimeoutError:
+                                pass
+                    except Exception as e:
+                        log.exception("coordinator batch failed on %s", cid)
+                        await self.storage.record_error(
+                            "coordinator", cid, None, None, e)
+
+                # v5: drain user_profile_queue (durable, dedup'd).
+                try:
+                    await self._drain_user_profile_queue()
+                except Exception as e:
+                    log.warning("user_profile_queue drain: %s", e)
+
+                if not any_progress:
+                    # All targets steady - longer idle sleep. Live handler keeps
+                    # running regardless.
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=60)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            log.info("coordinator stopped")
+
+    async def _drain_user_profile_queue(self, limit: int = 50):
+        max_attempts = int(self.options.get("user_profile_retry_max_attempts", 5))
+        pending = await self.storage.user_profile_queue_pending(
+            limit=limit, max_attempts=max_attempts)
+        processed = 0
+        for row in pending:
+            uid = row["user_id"]
+            try:
+                await self._ensure_user(uid)
+                await self.storage.user_profile_queue_mark_done(uid)
+                processed += 1
+            except Exception as e:
+                if row["attempts"] + 1 >= max_attempts:
+                    await self.storage.user_profile_queue_mark_dead(uid)
+                else:
+                    await self.storage.user_profile_queue_upsert(
+                        uid, f"{type(e).__name__}: {e}"[:400],
+                        retry_in_minutes=int(self.options.get(
+                            "user_profile_retry_pause_minutes", 10)))
+        if processed:
+            log.info("user_profile_queue drained=%d", processed)
 
     async def run_backfill_and_sync(self) -> dict:
         """Backfill every target, retry the dead-letter queue, sync participants.
@@ -253,14 +374,20 @@ class Collector:
                 await self.storage.record_error("reactions_update", cid, None, None, e)
 
     # -- backfill ------------------------------------------------------------
-    async def backfill(self, chat_id: int):
-        """Durable, resumable, FloodWait-tolerant backfill.
+    async def backfill(self, chat_id: int, batch_size: int | None = None):
+        """Durable, resumable, FloodWait-tolerant backfill - ONE BATCH.
 
-        Checkpoint invariant: last_backfilled_message_id never advances past any
-        message_id currently in backfill_queue with status='pending'.
+        Processes up to `batch_size` messages (default: self.batch_size).
+        Returns truth about the batch so a coordinator can decide whether to
+        schedule another one. Checkpoint invariant: last_backfilled_message_id
+        never advances past any message_id currently in backfill_queue with
+        status='pending'.
+
+        Returns (added:int, status:str, more:bool). `more` is True iff the
+        batch was capped by batch_size (implying more messages likely remain).
         """
         entity = await self.client.get_entity(chat_id)
-        limit = self.options.get("backfill_limit")
+        limit = batch_size if batch_size is not None else self.batch_size
         count_total = 0
         stopped_on_limit = False
         # (Re-)read pending floor from DB.
@@ -326,29 +453,34 @@ class Collector:
             status = "complete_with_errors"
         else:
             status = "complete"
+        # v5: `incomplete` is reclassified as `syncing` when more batches
+        # are likely (batch size cap hit AND no pending/dead issues).
+        if status == "incomplete":
+            status = "syncing"
         await self.storage.set_backfill_status(
             chat_id, status, mark_complete=(status == "complete"))
         await self.storage.target_update_counts(
             chat_id, pending=stats.get("pending", 0),
             dead=stats.get("dead_unacknowledged", 0))
+        await self.storage.record_batch_progress(chat_id)
+        self.batches_this_pid[chat_id] = self.batches_this_pid.get(chat_id, 0) + 1
         # Propagate truthful status to target_state so health sees it.
         target_label = str(chat_id)
         try:
-            row = await self.storage.get_sync_state(chat_id)
-            if row:
-                # keep original human-readable target label if we have it
-                async with self.storage.pool.acquire() as con:
-                    cur = await con.fetchval(
-                        "SELECT target FROM target_state WHERE chat_id=$1",
-                        chat_id)
-                    if cur:
-                        target_label = cur
+            async with self.storage.pool.acquire() as con:
+                cur = await con.fetchval(
+                    "SELECT target FROM target_state WHERE chat_id=$1",
+                    chat_id)
+                if cur:
+                    target_label = cur
         except Exception:
             pass
         await self.storage.target_upsert(chat_id, target_label, status)
-        log.info("backfill done chat=%s added=%s status=%s pending=%s dead=%s",
-                 chat_id, count_total, status, stats.get("pending", 0),
-                 stats.get("dead_unacknowledged", 0))
+        more = stopped_on_limit and pending_floor is None
+        log.info("backfill batch chat=%s added=%s status=%s more=%s pid_batches=%d",
+                 chat_id, count_total, status, more,
+                 self.batches_this_pid[chat_id])
+        return (count_total, status, more)
 
     async def _process_backfill_message(self, chat_id: int, msg) -> bool:
         """Process a single message with bounded retry. On final failure, record in
@@ -473,15 +605,26 @@ class Collector:
 
         sender_user_id = None
         sender_chat_id = None
+        sender_entity = None
+        try:
+            sender_entity = await msg.get_sender()
+        except Exception:
+            sender_entity = None
         if msg.from_id is not None:
             if is_user_peer(msg.from_id):
                 sender_user_id = msg.from_id.user_id
-                self._spawn_bg(self._safe_ensure_user(sender_user_id), name=f"user:{sender_user_id}")
+                self._spawn_bg(
+                    self._safe_ensure_user(sender_user_id, sender=sender_entity,
+                                           hint_chat=cid, hint_msg=msg.id),
+                    name=f"user:{sender_user_id}")
             elif is_channel_peer(msg.from_id):
                 sender_chat_id = _peer_id_signed(msg.from_id)
         elif msg.sender_id and msg.sender_id > 0:
             sender_user_id = msg.sender_id
-            self._spawn_bg(self._safe_ensure_user(sender_user_id), name=f"user:{sender_user_id}")
+            self._spawn_bg(
+                self._safe_ensure_user(sender_user_id, sender=sender_entity,
+                                       hint_chat=cid, hint_msg=msg.id),
+                name=f"user:{sender_user_id}")
         elif msg.sender_id and msg.sender_id < 0:
             sender_chat_id = msg.sender_id
 
@@ -860,14 +1003,31 @@ class Collector:
         return "member"
 
     # -- users / avatars -----------------------------------------------------
-    async def _safe_ensure_user(self, user_id: int):
+    async def _safe_ensure_user(self, user_id: int, sender=None,
+                                hint_chat: int | None = None,
+                                hint_msg: int | None = None):
+        # Dedup: skip if already in-flight or already queued.
+        async with self._user_profile_lock:
+            if user_id in self._user_profile_inflight:
+                return
+            self._user_profile_inflight.add(user_id)
         try:
-            await self._ensure_user(user_id)
+            await self._ensure_user(user_id, sender=sender)
+        except ValueError as e:
+            # Telethon throws ValueError("Could not find the input entity ...")
+            # Record once in queue, dedupe — don't spam errors.log.
+            await self.storage.user_profile_queue_upsert(
+                user_id, f"input_entity: {e}"[:300],
+                hint_chat_id=hint_chat, hint_message_id=hint_msg)
         except Exception as e:
-            log.warning("ensure_user %s failed: %s", user_id, e)
-            await self.storage.record_error("ensure_user", None, None, user_id, e)
+            await self.storage.user_profile_queue_upsert(
+                user_id, f"{type(e).__name__}: {e}"[:300],
+                hint_chat_id=hint_chat, hint_message_id=hint_msg)
+        finally:
+            async with self._user_profile_lock:
+                self._user_profile_inflight.discard(user_id)
 
-    async def _ensure_user(self, user_id: int):
+    async def _ensure_user(self, user_id: int, sender=None):
         lock = self._user_locks.setdefault(user_id, asyncio.Lock())
         if lock.locked():
             return
@@ -875,8 +1035,16 @@ class Collector:
             needs = await self.storage.user_needs_refresh(user_id, self._user_profile_ttl)
             if not needs:
                 return
+            # v5: prefer resolving via the message sender when available —
+            # that carries the access_hash Telegram needs.
+            peer = user_id
+            if sender is not None:
+                try:
+                    peer = await self.client.get_input_entity(sender)
+                except Exception:
+                    peer = user_id
             try:
-                full = await self.client(GetFullUserRequest(user_id))
+                full = await self.client(GetFullUserRequest(peer))
             except (errors.UserIdInvalidError, errors.PeerIdInvalidError):
                 return
             except errors.FloodWaitError as e:

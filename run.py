@@ -132,30 +132,13 @@ async def _main_inner(log: logging.Logger, cfg: dict,
         except Exception as e:
             log.warning("media sweep failed: %s", e)
 
-        try:
-            summary = await collector.run_backfill_and_sync()
-            if summary["failed"] and len(summary["failed"]) == summary["total"]:
-                await storage.set_runtime(
-                    os.getpid(), "unhealthy", collector.ok_targets,
-                    note=f"all targets failed: {summary['failed']}")
-            elif summary["degraded"] or summary["failed"]:
-                await storage.set_runtime(
-                    os.getpid(), "degraded", collector.ok_targets,
-                    note=f"degraded: failed={summary['failed']} "
-                         f"deg={summary['degraded']}")
-            else:
-                await storage.set_runtime(
-                    os.getpid(), "healthy", collector.ok_targets,
-                    note=None)
-        except Exception as e:
-            log.exception("run_backfill_and_sync failed")
-            await storage.record_error("backfill_cycle", None, None, None, e)
-            await storage.set_runtime(
-                os.getpid(), "degraded", collector.ok_targets,
-                note=f"backfill_cycle exception: {e}"[:300])
-
+        # v5: background coordinator runs batches in this very process while
+        # live handlers keep receiving updates.
+        await collector.start_coordinator()
         await collector.catch_up()
-        log.info("running; waiting for live updates. Ctrl+C to stop.")
+        await storage.set_runtime(
+            os.getpid(), "syncing", collector.ok_targets, note=None)
+        log.info("running; coordinator active; live updates on. Ctrl+C to stop.")
 
         await stop.wait()
         return EXIT_OK
@@ -170,6 +153,10 @@ async def _main_inner(log: logging.Logger, cfg: dict,
                 except BaseException:
                     pass
         if collector:
+            try:
+                await collector.stop_coordinator()
+            except Exception:
+                log.exception("coordinator stop failed")
             try:
                 await collector.wait_background(timeout=15)
             except Exception:

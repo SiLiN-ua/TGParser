@@ -269,6 +269,12 @@ class MediaQueue:
         return len(rows)
 
     async def _worker(self, idx: int):
+        import os as _os
+        pid = _os.getpid()
+        try:
+            await self.storage.worker_heartbeat(idx, pid=pid, current_file_id=None)
+        except Exception:
+            pass
         while True:
             item = await self.queue.get()
             if item is None:
@@ -276,16 +282,53 @@ class MediaQueue:
                 return
             file_id = item["desc"]["file_id"]
             try:
+                await self.storage.worker_heartbeat(
+                    idx, pid=pid, current_file_id=file_id)
+            except Exception:
+                pass
+            try:
                 await self._download(item)
-            except Exception as e:
-                log.warning("media worker %d failed on %s: %s", idx, file_id, e)
                 try:
-                    await self.storage.upsert_media_record({
-                        "file_id": file_id,
-                        "status": "failed",
-                        "last_error": str(e)[:500],
-                    })
-                    await self.storage.media_increment_attempt(file_id, str(e)[:500])
+                    await self.storage.worker_heartbeat(
+                        idx, pid=pid, current_file_id=None, completed_delta=1)
+                except Exception:
+                    pass
+            except Exception as e:
+                # v6: classify expired file reference as 'needs_refresh' so the
+                # coordinator refreshes the Message object instead of looping.
+                err_s = str(e)
+                try:
+                    from telethon.errors import FileReferenceExpiredError
+                    expired = isinstance(e, FileReferenceExpiredError)
+                except Exception:
+                    expired = False
+                if expired or "file reference" in err_s.lower() \
+                        or "FileReferenceExpired" in err_s:
+                    log.info("media %s: file reference expired -> needs_refresh",
+                             file_id)
+                    try:
+                        await self.storage.upsert_media_record({
+                            "file_id": file_id, "status": "needs_refresh",
+                            "last_error": "FileReferenceExpired",
+                        })
+                        await self.storage.media_increment_attempt(
+                            file_id, "FileReferenceExpired")
+                    except Exception:
+                        pass
+                else:
+                    log.warning("media worker %d failed on %s: %s", idx, file_id, e)
+                    try:
+                        await self.storage.upsert_media_record({
+                            "file_id": file_id, "status": "failed",
+                            "last_error": err_s[:500],
+                        })
+                        await self.storage.media_increment_attempt(file_id, err_s[:500])
+                    except Exception:
+                        pass
+                try:
+                    await self.storage.worker_heartbeat(
+                        idx, pid=pid, current_file_id=None,
+                        failed_delta=1, last_error=err_s[:300])
                 except Exception:
                     pass
             finally:

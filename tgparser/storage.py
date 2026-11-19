@@ -428,7 +428,9 @@ class Storage:
         """Set truthful backfill_status. Never marks `backfill_complete` TRUE
         unless `mark_complete=True` AND status='complete'."""
         assert status in {"running", "syncing", "complete", "incomplete",
-                          "blocked", "complete_with_errors"}
+                          "blocked", "complete_with_errors",
+                          "stalled", "degraded",
+                          "syncing_paused_media_backpressure"}
         async with self.pool.acquire() as con:
             if mark_complete and status == "complete":
                 await con.execute(
@@ -880,8 +882,149 @@ class Storage:
         async with self.pool.acquire() as con:
             row = await con.fetchval(
                 "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(first_seen)))::int "
-                "FROM media WHERE status IN ('pending','failed')")
+                "FROM media WHERE status IN ('pending','failed','needs_refresh')")
             return row
+
+    @_with_db_retry()
+    async def media_throughput(self) -> dict:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("""
+                SELECT COUNT(*) FILTER (WHERE completed_at > NOW() - interval '1 minute')  AS m1,
+                       COUNT(*) FILTER (WHERE completed_at > NOW() - interval '5 minutes') AS m5,
+                       COUNT(*) FILTER (WHERE completed_at > NOW() - interval '15 minutes') AS m15
+                FROM media WHERE status='done'
+            """)
+            return {"m1": row["m1"], "m5": row["m5"]/5.0, "m15": row["m15"]/15.0}
+
+    @_with_db_retry()
+    async def media_status_breakdown(self) -> dict:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT status, COUNT(*) FROM media GROUP BY status")
+            return {r["status"]: r["count"] for r in rows}
+
+    # --- v6: coordinator progress ------------------------------------------
+    @_with_db_retry()
+    async def coordinator_batch_start(self, chat_id: int, start_message_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO coordinator_progress (chat_id, batch_started_at,
+                    batch_last_progress_at, batch_last_message_id, batch_running,
+                    coordinator_heartbeat_at, updated_at)
+                VALUES ($1, NOW(), NOW(), $2, TRUE, NOW(), NOW())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    batch_started_at = NOW(),
+                    batch_last_progress_at = NOW(),
+                    batch_last_message_id = EXCLUDED.batch_last_message_id,
+                    batch_running = TRUE,
+                    coordinator_heartbeat_at = NOW(),
+                    updated_at = NOW();
+            """, chat_id, start_message_id)
+
+    @_with_db_retry()
+    async def coordinator_batch_progress(self, chat_id: int, message_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE coordinator_progress SET "
+                "batch_last_progress_at=NOW(), batch_last_message_id=$2, "
+                "coordinator_heartbeat_at=NOW(), updated_at=NOW() WHERE chat_id=$1",
+                chat_id, message_id)
+
+    @_with_db_retry()
+    async def coordinator_batch_end(self, chat_id: int, added: int,
+                                    duration_sec: int, success: bool,
+                                    reason: str | None = None):
+        async with self.pool.acquire() as con:
+            if success:
+                await con.execute("""
+                    UPDATE coordinator_progress SET
+                        batch_running=FALSE,
+                        consecutive_batch_failures=0,
+                        last_batch_duration_sec=$2,
+                        last_batch_added=$3,
+                        coordinator_heartbeat_at=NOW(),
+                        updated_at=NOW()
+                    WHERE chat_id=$1
+                """, chat_id, duration_sec, added)
+            else:
+                await con.execute("""
+                    UPDATE coordinator_progress SET
+                        batch_running=FALSE,
+                        consecutive_batch_failures=consecutive_batch_failures+1,
+                        last_batch_duration_sec=$2,
+                        last_batch_added=$3,
+                        last_recovery_at=NOW(),
+                        last_recovery_reason=$4,
+                        coordinator_heartbeat_at=NOW(),
+                        updated_at=NOW()
+                    WHERE chat_id=$1
+                """, chat_id, duration_sec, added, (reason or "")[:300])
+
+    @_with_db_retry()
+    async def coordinator_heartbeat(self, chat_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE coordinator_progress SET coordinator_heartbeat_at=NOW() "
+                "WHERE chat_id=$1", chat_id)
+
+    @_with_db_retry()
+    async def coordinator_progress_all(self) -> list:
+        async with self.pool.acquire() as con:
+            return [dict(r) for r in await con.fetch(
+                "SELECT chat_id, batch_started_at, batch_last_progress_at, "
+                "batch_last_message_id, batch_running, "
+                "consecutive_batch_failures, last_batch_duration_sec, "
+                "last_batch_added, last_recovery_at, last_recovery_reason, "
+                "coordinator_heartbeat_at FROM coordinator_progress")]
+
+    # --- v6: media worker heartbeats ---------------------------------------
+    @_with_db_retry()
+    async def worker_heartbeat(self, worker_id: int, pid: int | None = None,
+                               current_file_id: str | None = None,
+                               completed_delta: int = 0, failed_delta: int = 0,
+                               last_error: str | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO media_worker_state (worker_id, pid, started_at,
+                    heartbeat_at, current_file_id, completed_count, failed_count,
+                    last_error, updated_at)
+                VALUES ($1, $2, NOW(), NOW(), $3, $4, $5, $6, NOW())
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    pid = COALESCE(EXCLUDED.pid, media_worker_state.pid),
+                    heartbeat_at = NOW(),
+                    current_file_id = EXCLUDED.current_file_id,
+                    completed_count = media_worker_state.completed_count + $4,
+                    failed_count = media_worker_state.failed_count + $5,
+                    last_error = COALESCE(EXCLUDED.last_error, media_worker_state.last_error),
+                    updated_at = NOW();
+            """, worker_id, pid, current_file_id, completed_delta,
+                 failed_delta, (last_error or None))
+
+    @_with_db_retry()
+    async def workers_all(self) -> list:
+        async with self.pool.acquire() as con:
+            return [dict(r) for r in await con.fetch(
+                "SELECT worker_id, pid, "
+                "EXTRACT(EPOCH FROM (NOW()-heartbeat_at))::int AS heartbeat_age_sec, "
+                "current_file_id, completed_count, failed_count, last_error "
+                "FROM media_worker_state ORDER BY worker_id")]
+
+    @_with_db_retry()
+    async def media_mark_unavailable(self, file_id: str, reason: str):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE media SET status='unavailable', last_error=$2, "
+                "attempts=attempts+1 WHERE file_id=$1",
+                file_id, reason[:300])
+
+    @_with_db_retry()
+    async def media_needs_refresh(self, limit: int = 100) -> list:
+        async with self.pool.acquire() as con:
+            return [dict(r) for r in await con.fetch(
+                "SELECT file_id, chat_id, message_id, media_type, attempts "
+                "FROM media WHERE status='needs_refresh' "
+                "AND chat_id IS NOT NULL AND message_id IS NOT NULL "
+                "AND attempts < 5 ORDER BY first_seen LIMIT $1", limit)]
 
     # --- v4: telegram heartbeat ---------------------------------------------
     @_with_db_retry()

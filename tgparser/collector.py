@@ -77,6 +77,18 @@ class Collector:
                               options.get("backfill_limit") or 2000))
         self.batch_pause = int(options.get("backfill_batch_pause_seconds", 2))
         self.batch_concurrency = int(options.get("backfill_max_concurrency", 1))
+        # v6: stall recovery
+        self.batch_timeout = int(options.get("backfill_batch_timeout_seconds", 600))
+        self.progress_timeout = int(options.get("backfill_progress_timeout_seconds", 180))
+        self.recovery_backoff = int(options.get("backfill_recovery_backoff_seconds", 30))
+        self.max_consecutive_failures = int(options.get(
+            "backfill_max_consecutive_failures", 5))
+        # v6: media backpressure
+        self.media_hw = int(options.get("media_pending_high_water", 25_000))
+        self.media_lw = int(options.get("media_pending_low_water", 5_000))
+        # v6: expired reference retry
+        self.media_refresh_max = int(options.get("media_refresh_max_attempts", 3))
+
         self._user_profile_inflight: set[int] = set()
         self._user_profile_lock = asyncio.Lock()
         self._coordinator_task: asyncio.Task | None = None
@@ -163,10 +175,12 @@ class Collector:
                     pass
 
     async def _coordinator_loop(self):
-        log.info("coordinator started (batch_size=%s pause=%ss)",
-                 self.batch_size, self.batch_pause)
+        log.info(
+            "coordinator started (batch_size=%s pause=%ss timeout=%ss "
+            "progress_timeout=%ss hw/lw=%s/%s)",
+            self.batch_size, self.batch_pause, self.batch_timeout,
+            self.progress_timeout, self.media_hw, self.media_lw)
         try:
-            # First pass: participants + DLQ, then keep batching messages.
             if self._participants_sync:
                 for cid in self._targets:
                     if self._stop.is_set():
@@ -181,40 +195,171 @@ class Collector:
                 for cid in self._targets:
                     if self._stop.is_set():
                         break
+
+                    # v6: coordinator heartbeat so health sees aliveness
+                    await self.storage.coordinator_heartbeat(cid)
+
+                    # v6: media backpressure check
+                    pending = await self._media_pending_count()
+                    if pending > self.media_hw:
+                        log.info("backpressure: media pending %s > hw %s - pausing backfill",
+                                 pending, self.media_hw)
+                        await self.storage.set_backfill_status(
+                            cid, "syncing_paused_media_backpressure")
+                        # wait until pending drops below lw, with a cap so we don't wedge forever
+                        for _ in range(60):
+                            if self._stop.is_set():
+                                break
+                            await asyncio.sleep(10)
+                            pending = await self._media_pending_count()
+                            await self.storage.coordinator_heartbeat(cid)
+                            if pending < self.media_lw:
+                                break
+                        await self.storage.set_backfill_status(cid, "syncing")
+
+                    # v6: batch with hard timeout + progress watchdog
+                    batch_start = datetime.now(timezone.utc)
+                    added = 0; status = "syncing"; more = False
+                    reason = None; ok = True
                     try:
-                        added, status, more = await self.backfill(cid)
+                        added, status, more = await asyncio.wait_for(
+                            self.backfill(cid), timeout=self.batch_timeout)
                         if added:
                             any_progress = True
-                        if not more and status in ("complete", "complete_with_errors"):
-                            # Final DLQ pass once a chat reports complete.
-                            await self.retry_dead_letter(cid)
-                        if more:
-                            # Short pause between batches to respect rate limits.
-                            try:
-                                await asyncio.wait_for(
-                                    self._stop.wait(), timeout=self.batch_pause)
-                            except asyncio.TimeoutError:
-                                pass
+                    except asyncio.TimeoutError:
+                        ok = False
+                        reason = f"batch_timeout_{self.batch_timeout}s"
+                        log.warning("batch TIMEOUT on %s after %ss - recovering",
+                                    cid, self.batch_timeout)
+                        await self._recover_after_stall(cid, reason)
                     except Exception as e:
+                        ok = False
+                        reason = f"{type(e).__name__}: {e}"[:300]
                         log.exception("coordinator batch failed on %s", cid)
                         await self.storage.record_error(
-                            "coordinator", cid, None, None, e)
+                            "coordinator_batch", cid, None, None, e)
+                        await self._recover_after_stall(cid, reason)
 
-                # v5: drain user_profile_queue (durable, dedup'd).
+                    dur = int((datetime.now(timezone.utc) - batch_start).total_seconds())
+                    await self.storage.coordinator_batch_end(
+                        cid, added, dur, ok, reason)
+
+                    if not ok:
+                        await asyncio.sleep(self.recovery_backoff)
+                        prog = await self._coord_progress_row(cid)
+                        if prog and prog.get("consecutive_batch_failures", 0) >= self.max_consecutive_failures:
+                            log.error("target %s DEGRADED after %s consecutive failures",
+                                      cid, prog["consecutive_batch_failures"])
+                            await self.storage.set_backfill_status(cid, "degraded")
+                            # longer sleep before next attempt
+                            try:
+                                await asyncio.wait_for(
+                                    self._stop.wait(),
+                                    timeout=self.recovery_backoff * 10)
+                            except asyncio.TimeoutError:
+                                pass
+
+                    if ok and not more and status in ("complete", "complete_with_errors"):
+                        await self.retry_dead_letter(cid)
+
+                    if ok and more:
+                        try:
+                            await asyncio.wait_for(
+                                self._stop.wait(), timeout=self.batch_pause)
+                        except asyncio.TimeoutError:
+                            pass
+
+                # v5: user profile queue drain
                 try:
                     await self._drain_user_profile_queue()
                 except Exception as e:
                     log.warning("user_profile_queue drain: %s", e)
 
+                # v6: refresh media with expired file references
+                try:
+                    await self._refresh_media_needing_refresh()
+                except Exception as e:
+                    log.warning("media refresh: %s", e)
+
                 if not any_progress:
-                    # All targets steady - longer idle sleep. Live handler keeps
-                    # running regardless.
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=60)
                     except asyncio.TimeoutError:
                         pass
         finally:
             log.info("coordinator stopped")
+
+    async def _media_pending_count(self) -> int:
+        async with self.storage.pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT COUNT(*) FROM media WHERE status='pending'")
+
+    async def _coord_progress_row(self, chat_id: int) -> dict | None:
+        async with self.storage.pool.acquire() as con:
+            r = await con.fetchrow(
+                "SELECT * FROM coordinator_progress WHERE chat_id=$1", chat_id)
+            return dict(r) if r else None
+
+    async def _recover_after_stall(self, chat_id: int, reason: str):
+        """Called after batch timeout or exception.
+
+        1. Mark target stalled so health picks it up.
+        2. Disconnect+reconnect Telegram (handles Windows sleep / dropped socket).
+        3. catch_up live updates.
+        """
+        try:
+            await self.storage.set_backfill_status(chat_id, "stalled")
+        except Exception:
+            pass
+        try:
+            log.warning("TG recovery: disconnect+reconnect+catch_up (reason=%s)", reason)
+            try:
+                if self.client.is_connected():
+                    await self.client.disconnect()
+            except Exception:
+                pass
+            # Brief pause, then reconnect
+            await asyncio.sleep(2)
+            await self.client.connect()
+            try:
+                await self.client.catch_up()
+            except Exception as e:
+                log.info("catch_up during recovery soft-fail: %s", e)
+        except Exception as e:
+            log.warning("TG recovery failed: %s", e)
+
+    async def _refresh_media_needing_refresh(self):
+        """Re-fetch messages whose file_reference expired, then let the normal
+        media queue re-download them with the fresh reference."""
+        rows = await self.storage.media_needs_refresh(limit=20)
+        if not rows:
+            return
+        for r in rows:
+            fid = r["file_id"]
+            attempts = r["attempts"] or 0
+            if attempts >= self.media_refresh_max:
+                await self.storage.media_mark_unavailable(
+                    fid, "refresh_max_attempts_exhausted")
+                continue
+            try:
+                entity = await self.client.get_entity(r["chat_id"])
+                msg = await self.client.get_messages(entity, ids=r["message_id"])
+            except Exception as e:
+                await self.storage.media_increment_attempt(fid, f"refresh_fetch: {e}"[:300])
+                continue
+            if msg is None or getattr(msg, "media", None) is None:
+                await self.storage.media_mark_unavailable(
+                    fid, "source_message_gone_or_no_media")
+                continue
+            # Put the refreshed message back into the media queue (bypass dedup
+            # by releasing its in-flight marker).
+            try:
+                self.media_q._inflight.discard(fid)
+            except Exception:
+                pass
+            await self.media_q.enqueue(r["chat_id"], msg)
+
+    # kept for backward-compatibility with older tests that import this name
 
     async def _drain_user_profile_queue(self, limit: int = 50):
         max_attempts = int(self.options.get("user_profile_retry_max_attempts", 5))
@@ -403,6 +548,7 @@ class Collector:
             # We still iterate from checkpoint; the per-advance cap enforces the floor.
             log.info("backfill start chat=%s from>%s limit=%s pending_floor=%s",
                      chat_id, min_id, limit, pending_floor)
+            await self.storage.coordinator_batch_start(chat_id, min_id)
             run_count = 0
             last_id = min_id
             try:
@@ -415,7 +561,10 @@ class Collector:
                         if first_id is None or msg.id < first_id:
                             first_id = msg.id
                         await self._advance_checkpoint(chat_id, last_id, first_id)
-                    # Periodic cooperative sleep to be gentle on API.
+                        # v6: progress watchdog signal every message
+                        if run_count % 25 == 0:
+                            await self.storage.coordinator_batch_progress(
+                                chat_id, last_id)
                     if run_count and run_count % 100 == 0:
                         await asyncio.sleep(0.3)
                     if limit and count_total >= limit:

@@ -132,8 +132,13 @@ async def build_snapshot() -> dict:
                    (SELECT COUNT(*) FROM errors WHERE at > NOW() - interval '1 hour') errors_last_hour,
                    (SELECT MAX(at) FROM errors) last_error_at
         """))
-        distinct = await con.fetchval(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT chat_id, message_id FROM messages) x")
+        # v6: duplicate check in a SINGLE query - running backfill otherwise
+        # races and makes `distinct > count` (ghost "dupes").
+        dup_row = await con.fetchrow("""
+            SELECT COUNT(*) AS c, COUNT(*) - COUNT(DISTINCT (chat_id, message_id)) AS dups
+            FROM messages
+        """)
+        distinct = dup_row["c"] - dup_row["dups"]
         totals["errors_unresolved"] = await con.fetchval(
             "SELECT COUNT(*) FROM errors WHERE resolved_at IS NULL")
         totals["errors_unresolved_1h"] = await con.fetchval(
@@ -147,6 +152,12 @@ async def build_snapshot() -> dict:
     oldest_pending = await storage.media_oldest_pending_age()
     upq_stats = await storage.user_profile_queue_stats()
     errors_by_group = await storage.errors_unresolved_by_group()
+
+    # v6: coordinator progress + media throughput + worker state
+    coord_rows = await storage.coordinator_progress_all()
+    media_th = await storage.media_throughput()
+    media_status = await storage.media_status_breakdown()
+    workers = await storage.workers_all()
 
     # v5: active backfill progressing counts as syncing (not degraded).
     # We detect progress as last_batch_at freshness within the chat's state.
@@ -182,16 +193,49 @@ async def build_snapshot() -> dict:
     if not checks["no_unresolved_errors_1h"]:
         degraded_reasons.append(
             f"unresolved_errors_last_hour={totals['errors_unresolved_1h']}")
+    # v6: coordinator progress-staleness check (the fix for the 16h stuck v5 bug)
+    coord_by_chat = {c["chat_id"]: c for c in coord_rows}
     for t in targets:
-        if t["backfill_status"] == "blocked":
+        bs = t["backfill_status"]
+        cp = coord_by_chat.get(t["chat_id"]) or {}
+        progress_age = None
+        if cp.get("batch_last_progress_at"):
+            progress_age = (now - cp["batch_last_progress_at"]).total_seconds()
+        coord_hb_age = None
+        if cp.get("coordinator_heartbeat_at"):
+            coord_hb_age = (now - cp["coordinator_heartbeat_at"]).total_seconds()
+
+        if bs == "blocked":
             degraded_reasons.append(f"target_{t['chat_id']}_blocked")
-        elif t["backfill_status"] in ("syncing", "running"):
-            syncing_reasons.append(f"target_{t['chat_id']}_syncing")
-        elif t["backfill_status"] == "incomplete":
-            # legacy label; the coordinator should move it to `syncing`
+        elif bs == "stalled":
+            degraded_reasons.append(f"target_{t['chat_id']}_stalled")
+        elif bs == "degraded":
+            unhealthy_reasons.append(f"target_{t['chat_id']}_degraded")
+        elif bs == "syncing_paused_media_backpressure":
+            syncing_reasons.append(f"target_{t['chat_id']}_paused_backpressure")
+        elif bs in ("syncing", "running"):
+            # syncing requires fresh progress OR an idle/complete chat OR a
+            # fresh batch actively running.
+            if cp.get("batch_running") and progress_age is not None \
+                    and progress_age > 300:
+                # batch alive but no progress for 5+ minutes - STALE
+                degraded_reasons.append(
+                    f"target_{t['chat_id']}_progress_stale_{int(progress_age)}s")
+            elif coord_hb_age is not None and coord_hb_age > 600:
+                degraded_reasons.append(
+                    f"target_{t['chat_id']}_coord_hb_stale_{int(coord_hb_age)}s")
+            else:
+                syncing_reasons.append(f"target_{t['chat_id']}_syncing")
+        elif bs == "incomplete":
             syncing_reasons.append(f"target_{t['chat_id']}_syncing_legacy")
-        elif t["backfill_status"] == "complete_with_errors" and t["dead_count"] > 0:
+        elif bs == "complete_with_errors" and t["dead_count"] > 0:
             degraded_reasons.append(f"target_{t['chat_id']}_dead")
+
+    # v6: worker heartbeat staleness
+    for w in workers:
+        if w["heartbeat_age_sec"] is not None and w["heartbeat_age_sec"] > 300:
+            degraded_reasons.append(
+                f"worker_{w['worker_id']}_hb_stale_{int(w['heartbeat_age_sec'])}s")
 
     if unhealthy_reasons:
         status = "unhealthy"
@@ -217,6 +261,13 @@ async def build_snapshot() -> dict:
         "last_message_age_sec": last_msg_age,
         "messages_per_minute": mpm,
         "media_oldest_pending_age_sec": oldest_pending,
+        "media_throughput": media_th,
+        "media_status_breakdown": media_status,
+        "workers": workers,
+        "coordinator_progress": [
+            {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+             for k, v in row.items()} for row in coord_rows
+        ],
         "user_profile_queue": upq_stats,
         "errors_unresolved_by_group": errors_by_group,
         "active_targets": targets,

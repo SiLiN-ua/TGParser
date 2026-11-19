@@ -28,15 +28,49 @@ class StartupError(Exception):
 
 async def _tg_heartbeat_loop(client, storage, stop: asyncio.Event,
                              interval: int = 30):
-    """Periodically poke Telegram with a cheap authenticated call and
-    persist the result for health. Does NOT create a second client."""
+    """v6: hits an actual network RPC (GetState) so the cached get_me shortcut
+    can't paint a hung socket as healthy. Also detects large wall-clock jumps
+    (Windows sleep/resume) and triggers an explicit reconnect+catch_up."""
+    import time as _time
+    from telethon.tl.functions.updates import GetStateRequest
+
+    last_mono = _time.monotonic()
     while not stop.is_set():
+        now_mono = _time.monotonic()
+        # If we observe a gap much larger than our sleep interval, assume the
+        # host slept and the Telegram socket is probably dead.
+        if now_mono - last_mono > interval * 3:
+            logging.getLogger("tgparser").warning(
+                "heartbeat: monotonic jump %.0fs > %ss - reconnecting Telegram",
+                now_mono - last_mono, interval * 3)
+            try:
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+                await client.connect()
+                try:
+                    await client.catch_up()
+                except Exception:
+                    pass
+            except Exception as e:
+                logging.getLogger("tgparser").warning("post-wake reconnect failed: %s", e)
+        last_mono = now_mono
+
         try:
-            await client.get_me()
+            await asyncio.wait_for(client(GetStateRequest()), timeout=20)
             await storage.record_tg_ok()
         except Exception as e:
             try:
                 await storage.record_tg_error(str(e)[:400])
+            except Exception:
+                pass
+            # also try a reconnect best-effort
+            try:
+                if not client.is_connected():
+                    await client.connect()
             except Exception:
                 pass
         try:

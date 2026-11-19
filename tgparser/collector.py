@@ -281,9 +281,25 @@ class Collector:
                 except Exception as e:
                     log.warning("media refresh: %s", e)
 
-                if not any_progress:
+                # v7.1: only long-idle sleep when everything is naturally
+                # complete AND no failures. Otherwise short sleep so recovery
+                # can retry quickly.
+                any_more = False
+                for _c in self._targets:
+                    _s = await self.storage.get_sync_state(_c)
+                    if _s and _s["backfill_status"] in (
+                        "syncing", "running", "stalled", "degraded",
+                        "syncing_paused_media_backpressure"):
+                        any_more = True
+                        break
+                if not any_progress and not any_more:
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=60)
+                    except asyncio.TimeoutError:
+                        pass
+                elif not any_progress:
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=2)
                     except asyncio.TimeoutError:
                         pass
         finally:
@@ -303,12 +319,15 @@ class Collector:
     async def _recover_after_stall(self, chat_id: int, reason: str):
         """Called after batch timeout or exception.
 
-        1. Mark target stalled so health picks it up.
+        1. Mark target stalled so health picks it up — UNLESS it's already
+           'degraded' (max consecutive failures reached), which must stick.
         2. Disconnect+reconnect Telegram (handles Windows sleep / dropped socket).
         3. catch_up live updates.
         """
         try:
-            await self.storage.set_backfill_status(chat_id, "stalled")
+            cur = await self.storage.get_sync_state(chat_id)
+            if not cur or cur["backfill_status"] != "degraded":
+                await self.storage.set_backfill_status(chat_id, "stalled")
         except Exception:
             pass
         try:

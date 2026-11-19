@@ -23,6 +23,11 @@ async def test_full_user_stores_access_hash(storage):
 
 @pytest.mark.asyncio
 async def test_min_entity_does_not_overwrite_full(storage):
+    """v7.1: fixed behavior per official Telegram rules.
+
+    full hash=111 MUST stay active; a later min hash=222 is written to
+    access_hash_history but does NOT become active, and entity_quality
+    stays 'full'."""
     now = datetime.now(timezone.utc)
     await storage.upsert_user_from_entity({
         "id": 1002, "access_hash": 111, "username": "full_name",
@@ -30,7 +35,6 @@ async def test_min_entity_does_not_overwrite_full(storage):
         "entity_quality": "full", "entity_source": "full",
         "full_fetched_at": now,
     })
-    # a later min entity arrives with a different access_hash and no name
     await storage.upsert_user_from_entity({
         "id": 1002, "access_hash": 222,
         "entity_quality": "min", "entity_source": "message_sender",
@@ -38,13 +42,21 @@ async def test_min_entity_does_not_overwrite_full(storage):
     })
     async with storage.pool.acquire() as c:
         row = await c.fetchrow(
-            "SELECT username, first_name, bio, entity_quality, access_hash "
+            "SELECT username, first_name, bio, entity_quality, access_hash, access_hash_kind "
             "FROM users WHERE id=1002")
+        hist = await c.fetch(
+            "SELECT kind, access_hash, is_active FROM access_hash_history "
+            "WHERE user_id=1002 ORDER BY id")
     assert row["username"] == "full_name"           # preserved
     assert row["first_name"] == "Full"              # preserved
     assert row["bio"] == "I am full"                # preserved
     assert row["entity_quality"] == "full"          # not downgraded
-    assert row["access_hash"] == 222                # access_hash refreshed
+    assert row["access_hash"] == 111                # full remains active
+    assert row["access_hash_kind"] == "full"
+    # Both hashes are in history; only full is active
+    kinds_active = {(r["kind"], r["is_active"]) for r in hist}
+    assert ("full", True) in kinds_active
+    assert ("min", False) in kinds_active
 
 
 @pytest.mark.asyncio

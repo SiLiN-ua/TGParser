@@ -132,13 +132,20 @@ async def build_snapshot() -> dict:
                    (SELECT COUNT(*) FROM errors WHERE at > NOW() - interval '1 hour') errors_last_hour,
                    (SELECT MAX(at) FROM errors) last_error_at
         """))
-        # v6: duplicate check in a SINGLE query - running backfill otherwise
-        # races and makes `distinct > count` (ghost "dupes").
-        dup_row = await con.fetchrow("""
-            SELECT COUNT(*) AS c, COUNT(*) - COUNT(DISTINCT (chat_id, message_id)) AS dups
-            FROM messages
-        """)
-        distinct = dup_row["c"] - dup_row["dups"]
+        # v7.1: run the count + distinct + duplicate_count in ONE snapshot
+        # inside a REPEATABLE READ transaction so concurrent live inserts can
+        # never produce a ghost "dupe". Also override totals["msgs"] with the
+        # count from this snapshot so the derived numbers agree.
+        async with con.transaction(isolation="repeatable_read"):
+            dup_row = await con.fetchrow("""
+                SELECT COUNT(*) AS c,
+                       COUNT(DISTINCT (chat_id, message_id)) AS distinct_c,
+                       COUNT(*) - COUNT(DISTINCT (chat_id, message_id)) AS dups
+                FROM messages
+            """)
+        totals["msgs"] = dup_row["c"]
+        totals["duplicate_count"] = dup_row["dups"]
+        distinct = dup_row["distinct_c"]
         totals["errors_unresolved"] = await con.fetchval(
             "SELECT COUNT(*) FROM errors WHERE resolved_at IS NULL")
         totals["errors_unresolved_1h"] = await con.fetchval(

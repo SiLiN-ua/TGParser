@@ -1017,52 +1017,134 @@ class Storage:
                 "attempts=attempts+1 WHERE file_id=$1",
                 file_id, reason[:300])
 
-    # --- v7: user identity enrichment --------------------------------------
+    # --- v7.1: user identity enrichment --------------------------------------
+    # entity_quality rank (for name/bio/username downgrade protection)
     _QUALITY_RANK = {"min": 1, "normal": 2, "full": 3}
+
+    # access_hash priority rank (official Telegram rules at
+    # https://core.telegram.org/api/peers "Access hash"):
+    #   full > from_message > min > zero > unknown
+    _AH_PRIORITY = {"full": 4, "from_message": 3, "min": 2, "zero": 1, "unknown": 0}
+
+    @staticmethod
+    def _hash_fp(ah: int | None) -> str | None:
+        if ah is None:
+            return None
+        import hashlib
+        # md5 matches the DB fingerprint we seeded in migration 0010
+        return hashlib.md5(str(ah).encode()).hexdigest()
 
     @_with_db_retry()
     async def upsert_user_from_entity(self, data: dict, record_history: bool = True):
         """Store a user row from a Telethon-style entity dict.
 
-        Downgrade protection: if the new quality is lower than what we have
-        (e.g. a `min` entity arrives after we already stored a `full` one),
-        we only refresh timestamps + access_hash, never overwrite
-        username/name/bio with weaker data.
+        Enforces official Telegram access_hash priority rules AND the broader
+        entity_quality downgrade protection.
         """
         uid = data["id"]
         new_q = data.get("entity_quality") or "normal"
         new_rank = self._QUALITY_RANK.get(new_q, 1)
+
+        # Access-hash classification. Callers pass access_hash_kind explicitly;
+        # default to 'unknown' when not stated (never promotes).
+        new_ah = data.get("access_hash")
+        new_ah_kind = data.get("access_hash_kind") or (
+            "full" if new_q == "full" else
+            ("min" if data.get("is_min") else
+             ("from_message" if data.get("entity_source") == "message_sender" else "unknown"))
+        )
+        new_ah_prio = self._AH_PRIORITY.get(new_ah_kind, 0)
+        new_auth_fp = data.get("access_hash_auth_fingerprint") or "default"
+
         async with self.pool.acquire() as con:
             prev = await con.fetchrow(
                 "SELECT username, first_name, last_name, bio, photo_file_id, "
-                "entity_quality, access_hash FROM users WHERE id=$1::bigint", uid)
+                "entity_quality, access_hash, access_hash_kind, "
+                "access_hash_priority, access_hash_auth_fingerprint "
+                "FROM users WHERE id=$1::bigint", uid)
             prev_q = (prev["entity_quality"] if prev else None) or "min"
             prev_rank = self._QUALITY_RANK.get(prev_q, 0)
+            prev_ah_prio = (prev["access_hash_priority"] if prev else 0) or 0
+            prev_auth_fp = (prev["access_hash_auth_fingerprint"] if prev else None) or "default"
+
+            # Decide whether the new access_hash is ALLOWED to become active.
+            # Rule 1: never from a different auth session.
+            # Rule 2: lower priority never beats higher.
+            # Rule 3: same priority is allowed to refresh (hash may have rotated).
+            # Rule 4: null doesn't clear an existing active hash.
+            ah_applies = False
+            if new_ah is not None:
+                if prev is None:
+                    # new user row - always apply
+                    ah_applies = True
+                elif new_auth_fp == prev_auth_fp:
+                    ah_applies = new_ah_prio >= prev_ah_prio
+
+            # Always record every observed hash in history, even if not active.
+            if new_ah is not None:
+                await con.execute("""
+                    INSERT INTO access_hash_history
+                        (user_id, hash_fingerprint, access_hash, kind, priority,
+                         source, auth_fingerprint, source_chat_id, source_message_id,
+                         first_seen, last_seen, became_active_at, is_active)
+                    VALUES ($1::bigint, $2, $3::bigint, $4, $5, $6, $7, $8, $9,
+                            NOW(), NOW(),
+                            CASE WHEN $10 THEN NOW() END, $10)
+                    ON CONFLICT (user_id, hash_fingerprint, auth_fingerprint)
+                    DO UPDATE SET last_seen=NOW(),
+                        is_active = access_hash_history.is_active OR EXCLUDED.is_active,
+                        became_active_at = COALESCE(access_hash_history.became_active_at,
+                                                     EXCLUDED.became_active_at);
+                """, uid, self._hash_fp(new_ah), new_ah, new_ah_kind, new_ah_prio,
+                     data.get("entity_source"), new_auth_fp,
+                     data.get("source_chat_id"), data.get("source_message_id"),
+                     ah_applies)
 
             if prev and new_rank < prev_rank:
-                # downgrade: refresh only technical fields
+                # downgrade of OVERALL quality: refresh only technical fields.
+                # Still apply ah if rules permit.
                 await con.execute("""
                     UPDATE users SET
-                        access_hash = COALESCE($2::bigint, access_hash),
-                        access_hash_updated_at = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE access_hash_updated_at END,
+                        access_hash = CASE WHEN $3 THEN $2::bigint ELSE access_hash END,
+                        access_hash_kind = CASE WHEN $3 THEN $4 ELSE access_hash_kind END,
+                        access_hash_priority = CASE WHEN $3 THEN $5 ELSE access_hash_priority END,
+                        access_hash_updated_at = CASE WHEN $3 THEN NOW()
+                                                     ELSE access_hash_updated_at END,
+                        access_hash_source_chat_id = CASE WHEN $3 THEN $6
+                                                         ELSE access_hash_source_chat_id END,
+                        access_hash_source_message_id = CASE WHEN $3 THEN $7
+                                                            ELSE access_hash_source_message_id END,
+                        access_hash_is_stale = CASE WHEN $3 THEN FALSE
+                                                   ELSE access_hash_is_stale END,
                         last_seen = NOW(),
                         last_updated = NOW()
                      WHERE id = $1::bigint
-                """, uid, data.get("access_hash"))
+                """, uid, new_ah, ah_applies, new_ah_kind, new_ah_prio,
+                     data.get("source_chat_id"), data.get("source_message_id"))
                 return
 
-            # upsert with new quality taking over
+            # upsert with new quality taking over. access_hash columns obey
+            # the priority rule (ah_applies), computed above.
             await con.execute("""
                 INSERT INTO users (
                     id, access_hash, access_hash_updated_at,
+                    access_hash_kind, access_hash_priority,
+                    access_hash_auth_fingerprint,
+                    access_hash_source_chat_id, access_hash_source_message_id,
                     username, first_name, last_name, phone, bio,
                     is_bot, is_premium, is_scam, is_fake, is_verified, is_deleted,
                     is_contact, is_mutual_contact, is_close_friend, is_min,
                     lang_code, photo_path, photo_dc, photo_file_id,
                     entity_source, entity_quality,
                     raw, full_fetched_at, first_seen, last_seen, last_updated)
-                VALUES ($1::bigint, $2::bigint,
-                    CASE WHEN $2 IS NOT NULL THEN NOW() END,
+                VALUES ($1::bigint,
+                    CASE WHEN $26 THEN $2::bigint END,
+                    CASE WHEN $26 AND $2 IS NOT NULL THEN NOW() END,
+                    CASE WHEN $26 THEN $27::text END,
+                    CASE WHEN $26 THEN $28::int ELSE 0 END,
+                    CASE WHEN $26 THEN $29::text END,
+                    CASE WHEN $26 THEN $30::bigint END,
+                    CASE WHEN $26 THEN $31::bigint END,
                     $3,$4,$5,$6,$7,
                     $8,$9,$10,$11,$12,$13,
                     $14,$15,$16,$17,
@@ -1070,10 +1152,16 @@ class Storage:
                     $22,$23,
                     $24::jsonb,$25,NOW(),NOW(),NOW())
                 ON CONFLICT (id) DO UPDATE SET
-                    access_hash = COALESCE(EXCLUDED.access_hash, users.access_hash),
+                    access_hash = CASE WHEN $26 THEN $2::bigint ELSE users.access_hash END,
+                    access_hash_kind = CASE WHEN $26 THEN $27::text ELSE users.access_hash_kind END,
+                    access_hash_priority = CASE WHEN $26 THEN $28::int ELSE users.access_hash_priority END,
+                    access_hash_auth_fingerprint = CASE WHEN $26 THEN $29::text ELSE users.access_hash_auth_fingerprint END,
+                    access_hash_source_chat_id = CASE WHEN $26 THEN $30::bigint ELSE users.access_hash_source_chat_id END,
+                    access_hash_source_message_id = CASE WHEN $26 THEN $31::bigint ELSE users.access_hash_source_message_id END,
+                    access_hash_is_stale = CASE WHEN $26 THEN FALSE ELSE users.access_hash_is_stale END,
                     access_hash_updated_at = CASE
-                        WHEN EXCLUDED.access_hash IS NOT NULL
-                             AND EXCLUDED.access_hash IS DISTINCT FROM users.access_hash
+                        WHEN $26 AND $2 IS NOT NULL
+                             AND ($2::bigint IS DISTINCT FROM users.access_hash)
                         THEN NOW()
                         ELSE users.access_hash_updated_at END,
                     username   = COALESCE(EXCLUDED.username,  users.username),
@@ -1101,7 +1189,7 @@ class Storage:
                     full_fetched_at = COALESCE(EXCLUDED.full_fetched_at, users.full_fetched_at),
                     last_seen = NOW(),
                     last_updated = NOW();
-            """, uid, data.get("access_hash"),
+            """, uid, new_ah,
                  data.get("username"), data.get("first_name"), data.get("last_name"),
                  data.get("phone"), data.get("bio"),
                  data.get("is_bot"), data.get("is_premium"), data.get("is_scam"),
@@ -1111,7 +1199,9 @@ class Storage:
                  data.get("lang_code"), data.get("photo_path"),
                  data.get("photo_dc"), data.get("photo_file_id"),
                  data.get("entity_source"), new_q,
-                 _j(data.get("raw")), data.get("full_fetched_at"))
+                 _j(data.get("raw")), data.get("full_fetched_at"),
+                 ah_applies, new_ah_kind, new_ah_prio, new_auth_fp,
+                 data.get("source_chat_id"), data.get("source_message_id"))
 
             if record_history and prev is not None:
                 for field in ("username", "first_name", "last_name", "bio",
@@ -1140,15 +1230,105 @@ class Storage:
                                       access_hash_present: bool,
                                       raw_meta: dict | None = None):
         async with self.pool.acquire() as con:
+            # v7.1: dedup via UNIQUE(user_id,chat_id,COALESCE(message_id,0),source_type)
             await con.execute("""
                 INSERT INTO user_observations
                   (user_id, chat_id, message_id, source_type, entity_quality,
                    username_at_time, display_name_at_time, access_hash_present,
                    raw_meta)
                 VALUES ($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+                ON CONFLICT (user_id, chat_id, (COALESCE(message_id, 0)), source_type)
+                DO UPDATE SET observed_at=NOW(),
+                    entity_quality=EXCLUDED.entity_quality,
+                    access_hash_present=user_observations.access_hash_present
+                                        OR EXCLUDED.access_hash_present
             """, user_id, chat_id, message_id, source_type, entity_quality,
                  username_at_time, display_name_at_time, access_hash_present,
                  _j(raw_meta))
+
+    # --- v7.1: access_hash aggregates / stale flag ---------------------------
+    @_with_db_retry()
+    async def access_hash_aggregates(self) -> dict:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("""
+                SELECT COUNT(*) AS users_total,
+                   COUNT(*) FILTER (WHERE access_hash IS NOT NULL
+                                      AND access_hash_kind='full' AND NOT access_hash_is_stale) AS with_full,
+                   COUNT(*) FILTER (WHERE access_hash IS NOT NULL
+                                      AND access_hash_kind='from_message' AND NOT access_hash_is_stale) AS with_from_message,
+                   COUNT(*) FILTER (WHERE access_hash IS NOT NULL
+                                      AND access_hash_kind='min' AND NOT access_hash_is_stale) AS with_min,
+                   COUNT(*) FILTER (WHERE access_hash IS NOT NULL
+                                      AND access_hash_kind='zero' AND NOT access_hash_is_stale) AS with_zero,
+                   COUNT(*) FILTER (WHERE access_hash IS NOT NULL
+                                      AND access_hash_kind='unknown' AND NOT access_hash_is_stale) AS with_unknown,
+                   COUNT(*) FILTER (WHERE access_hash IS NULL) AS without,
+                   COUNT(*) FILTER (WHERE access_hash_is_stale) AS stale
+                FROM users WHERE id > 0
+            """)
+            return dict(row)
+
+    @_with_db_retry()
+    async def access_hash_mark_stale(self, user_id: int, reason: str):
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    "UPDATE users SET access_hash_is_stale=TRUE WHERE id=$1::bigint",
+                    user_id)
+                await con.execute(
+                    "UPDATE access_hash_history SET replaced_at=NOW(), "
+                    "replacement_reason=$2, is_active=FALSE "
+                    "WHERE user_id=$1::bigint AND is_active=TRUE",
+                    user_id, (reason or "")[:300])
+
+    # --- v7.1: identity enrichment queue ---------------------------------
+    @_with_db_retry()
+    async def identity_enqueue(self, user_id: int, priority: int = 1000,
+                               hint_chat_id: int | None = None,
+                               hint_message_id: int | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO identity_enrichment_queue
+                    (user_id, priority, hint_chat_id, hint_message_id)
+                VALUES ($1::bigint, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    priority = LEAST(identity_enrichment_queue.priority, EXCLUDED.priority),
+                    hint_chat_id = COALESCE(identity_enrichment_queue.hint_chat_id, EXCLUDED.hint_chat_id),
+                    hint_message_id = COALESCE(identity_enrichment_queue.hint_message_id, EXCLUDED.hint_message_id);
+            """, user_id, priority, hint_chat_id, hint_message_id)
+
+    @_with_db_retry()
+    async def identity_pending(self, limit: int = 20, max_attempts: int = 5) -> list:
+        async with self.pool.acquire() as con:
+            return [dict(r) for r in await con.fetch(
+                "SELECT user_id, priority, attempts, hint_chat_id, hint_message_id "
+                "FROM identity_enrichment_queue "
+                "WHERE status IN ('pending','waiting_entity') "
+                "AND attempts < $2 "
+                "AND (next_retry_at IS NULL OR next_retry_at <= NOW()) "
+                "ORDER BY priority, first_seen LIMIT $1", limit, max_attempts)]
+
+    @_with_db_retry()
+    async def identity_mark(self, user_id: int, status: str,
+                            error: str | None = None, retry_in_minutes: int = 10):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                UPDATE identity_enrichment_queue
+                   SET status=$2,
+                       attempts=attempts+1,
+                       last_error=COALESCE($3, last_error),
+                       last_attempt_at=NOW(),
+                       next_retry_at=NOW() + ($4 || ' minutes')::interval
+                 WHERE user_id=$1::bigint
+            """, user_id, status, (error or "")[:500] if error else None,
+                 str(retry_in_minutes))
+
+    @_with_db_retry()
+    async def identity_stats(self) -> dict:
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT status, count(*) FROM identity_enrichment_queue GROUP BY status")
+            return {r["status"]: r["count"] for r in rows}
 
     @_with_db_retry()
     async def user_access_hash(self, user_id: int) -> int | None:

@@ -199,28 +199,32 @@ class Collector:
                     # v6: coordinator heartbeat so health sees aliveness
                     await self.storage.coordinator_heartbeat(cid)
 
-                    # v6: media backpressure check
+                    # v7.3: media backpressure - true hysteresis.
+                    # Invariant: no new backfill batch starts while DB pending
+                    # is >= media_lw. The v7.2 variant (60-iteration cap then
+                    # unconditional resume) could kick off a new 2000-msg batch
+                    # with pending still far above HWM, growing the backlog.
+                    # Here we stay paused until pending actually drops below
+                    # LWM or _stop is set, but keep heartbeating, re-sweeping
+                    # the in-memory queue, and watching for silently-dead
+                    # workers (done_count stops changing while q_depth > 0).
                     pending = await self._media_pending_count()
                     if pending > self.media_hw:
                         log.info("backpressure: media pending %s > hw %s - pausing backfill",
                                  pending, self.media_hw)
                         await self.storage.set_backfill_status(
                             cid, "syncing_paused_media_backpressure")
-                        # wait until pending drops below lw, with a cap so we don't wedge forever
-                        for _ in range(60):
-                            if self._stop.is_set():
-                                break
-                            await asyncio.sleep(10)
+                        last_done_check_at = datetime.now(timezone.utc)
+                        last_done_count = await self._media_done_count()
+                        while pending >= self.media_lw and not self._stop.is_set():
+                            try:
+                                await asyncio.wait_for(self._stop.wait(), timeout=10)
+                                break  # _stop was set
+                            except asyncio.TimeoutError:
+                                pass
                             pending = await self._media_pending_count()
                             await self.storage.coordinator_heartbeat(cid)
-                            if pending < self.media_lw:
-                                break
-                            # v7.2: re-prime the asyncio media queue if workers
-                            # have run dry while DB still holds thousands of
-                            # pending rows. Without this, pending rows left
-                            # behind by a previous crash (seen when the
-                            # startup sweep's limit of 500 caps the re-queue)
-                            # starve workers and deadlock the wait.
+                            # resweep if in-memory queue has drained
                             try:
                                 q_depth = (self.media_q.queue.qsize()
                                            + len(self.media_q._inflight))
@@ -234,6 +238,31 @@ class Collector:
                                             swept, pending, q_depth)
                             except Exception:
                                 log.exception("backpressure resweep failed")
+                            # periodic liveness check for media workers:
+                            # if done_count hasn't moved for 5 min while q_depth
+                            # >0 we log a warning (don't force degraded to
+                            # avoid false positives on legitimately slow
+                            # downloads, e.g. one large video).
+                            now = datetime.now(timezone.utc)
+                            if (now - last_done_check_at).total_seconds() >= 300:
+                                cur_done = await self._media_done_count()
+                                if (cur_done == last_done_count
+                                        and q_depth > 0
+                                        and not self._stop.is_set()):
+                                    log.warning(
+                                        "backpressure: media workers made no "
+                                        "progress for 5 min (done=%s, q_depth=%s); "
+                                        "coordinator remains paused and will keep "
+                                        "re-sweeping, but media pipeline may be "
+                                        "stuck - inspect media worker heartbeats.",
+                                        cur_done, q_depth)
+                                last_done_count = cur_done
+                                last_done_check_at = now
+                        if self._stop.is_set():
+                            continue
+                        # pending < LWM -> hysteresis resume
+                        log.info("backpressure: resume (pending=%s < lw=%s)",
+                                 pending, self.media_lw)
                         await self.storage.set_backfill_status(cid, "syncing")
 
                     # v6: batch with hard timeout + progress watchdog
@@ -328,6 +357,11 @@ class Collector:
         async with self.storage.pool.acquire() as con:
             return await con.fetchval(
                 "SELECT COUNT(*) FROM media WHERE status='pending'")
+
+    async def _media_done_count(self) -> int:
+        async with self.storage.pool.acquire() as con:
+            return await con.fetchval(
+                "SELECT COUNT(*) FROM media WHERE status='done'")
 
     async def _coord_progress_row(self, chat_id: int) -> dict | None:
         async with self.storage.pool.acquire() as con:

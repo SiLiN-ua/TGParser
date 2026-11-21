@@ -429,3 +429,202 @@ async def test_max_consecutive_failures_marks_degraded(storage, tmp_path):
 
     state = await storage.get_sync_state(cid)
     assert state["backfill_status"] == "degraded"
+
+
+
+# v7.3 regression: multiple-active history after promotion ------------------
+@pytest.mark.asyncio
+async def test_promotion_retires_previous_active_history(storage):
+    """v7.3: promoting a user to a higher-priority hash within the same auth
+    session must leave at most one is_active history row for that user. The
+    v7.1/v7.2 bug kept both the legacy and the promoted row active."""
+    uid = 777001
+    # 1) legacy hash, auth_fp='legacy' as if seeded by migration 0010.
+    await storage.upsert_user_from_entity({
+        "id": uid, "access_hash": 111111,
+        "entity_quality": "min", "entity_source": "message_sender",
+        "access_hash_kind": "unknown",
+        "access_hash_auth_fingerprint": "sess_A",
+    })
+    # 2) new, higher-priority observation from the SAME auth session.
+    await storage.upsert_user_from_entity({
+        "id": uid, "access_hash": 222222,
+        "entity_quality": "full", "entity_source": "full",
+        "access_hash_kind": "full",
+        "full_fetched_at": datetime.now(timezone.utc),
+        "access_hash_auth_fingerprint": "sess_A",
+    })
+    async with storage.pool.acquire() as c:
+        active_rows = await c.fetchval(
+            "SELECT COUNT(*) FROM access_hash_history "
+            "WHERE user_id=$1 AND is_active=TRUE", uid)
+        all_rows = await c.fetchval(
+            "SELECT COUNT(*) FROM access_hash_history WHERE user_id=$1", uid)
+        winner_hash = await c.fetchval(
+            "SELECT access_hash FROM access_hash_history "
+            "WHERE user_id=$1 AND is_active=TRUE", uid)
+    assert active_rows == 1
+    assert all_rows == 2          # both rows preserved (append-only)
+    assert winner_hash == 222222   # the full-priority hash wins
+
+
+@pytest.mark.asyncio
+async def test_promotion_does_not_deactivate_foreign_session(storage):
+    """A promotion in session A must not flip an is_active row from session B.
+    Guards the per-auth_fingerprint scope of the deactivation UPDATE."""
+    uid = 777002
+    await storage.upsert_user_from_entity({
+        "id": uid, "access_hash": 111111,
+        "entity_quality": "normal", "entity_source": "message_sender",
+        "access_hash_kind": "from_message",
+        "access_hash_auth_fingerprint": "sess_B",
+    })
+    # Different session observes the same user; priority rule won't apply ah,
+    # but the history row from B must stay is_active=TRUE.
+    await storage.upsert_user_from_entity({
+        "id": uid, "access_hash": 333333,
+        "entity_quality": "full", "entity_source": "full",
+        "access_hash_kind": "full",
+        "full_fetched_at": datetime.now(timezone.utc),
+        "access_hash_auth_fingerprint": "sess_A",
+    })
+    async with storage.pool.acquire() as c:
+        rows = await c.fetch(
+            "SELECT auth_fingerprint, is_active FROM access_hash_history "
+            "WHERE user_id=$1 ORDER BY auth_fingerprint", uid)
+    sess_b = [r for r in rows if r["auth_fingerprint"] == "sess_B"]
+    assert len(sess_b) == 1
+    assert sess_b[0]["is_active"] is True
+
+
+# v7.3 regression: backpressure hysteresis (no timeout-driven resume) -------
+@pytest.mark.asyncio
+async def test_backpressure_pause_holds_until_pending_below_lwm(storage, tmp_path, monkeypatch):
+    """v7.3: coordinator must NOT start a new backfill batch while DB pending
+    is at/above media_lw, regardless of elapsed time. The v7.1/v7.2 for-loop
+    timeout released the pause after ~10 min with pending still huge."""
+    from tgparser.collector import Collector
+    from tgparser.media_queue import MediaQueue
+    cid = -1001234567100
+    await storage.upsert_chat({"id": cid, "type": "supergroup", "title": "t"})
+    async with storage.pool.acquire() as c:
+        await c.execute(
+            "INSERT INTO sync_state (chat_id, backfill_status) "
+            "VALUES ($1,'syncing') ON CONFLICT (chat_id) DO NOTHING", cid)
+        await c.execute(
+            "INSERT INTO coordinator_progress (chat_id) "
+            "VALUES ($1) ON CONFLICT (chat_id) DO NOTHING", cid)
+    msgs = [_FakeMsg(i, cid) for i in range(1, 5)]
+    client = _StallingLoopClient(msgs, hang_after=100)
+
+    mq = MediaQueue(client, storage, base_dir=str(tmp_path),
+                    max_media_mb=10, concurrency=1)
+    coll = Collector(client, storage, mq, {
+        "backfill_batch_size": 10,
+        "backfill_batch_timeout_seconds": 2,
+        "backfill_batch_pause_seconds": 0,
+        "backfill_max_consecutive_failures": 5,
+        "backfill_recovery_backoff_seconds": 0,
+        "download_media": False,
+        "follow_linked_discussion": False,
+        "participants_sync": False,
+        "media_pending_high_water": 100,
+        "media_pending_low_water": 20,
+    })
+    coll._targets = [cid]
+
+    # Hold pending >> HWM throughout the first observation window.
+    pending_value = {"n": 500}
+    async def _fake_pending_count():
+        return pending_value["n"]
+    async def _fake_done_count():
+        return 0
+    monkeypatch.setattr(coll, "_media_pending_count", _fake_pending_count)
+    monkeypatch.setattr(coll, "_media_done_count", _fake_done_count)
+
+    batch_calls = {"n": 0}
+    orig_backfill = coll.backfill
+    async def _spy_backfill(*a, **kw):
+        batch_calls["n"] += 1
+        return await orig_backfill(*a, **kw)
+    monkeypatch.setattr(coll, "backfill", _spy_backfill)
+
+    coord_task = asyncio.create_task(coll._coordinator_loop())
+    # Let it sit in pause for 3 seconds with pending high.
+    await asyncio.sleep(3)
+    batches_during_pause = batch_calls["n"]
+    state_during_pause = await storage.get_sync_state(cid)
+
+    # Drop pending below LWM. Resume should fire on next 10s iteration.
+    pending_value["n"] = 5
+    # wait up to 15 s for the loop to notice
+    for _ in range(150):
+        s = await storage.get_sync_state(cid)
+        if s and s["backfill_status"] != "syncing_paused_media_backpressure":
+            break
+        await asyncio.sleep(0.1)
+    coll._stop.set()
+    try:
+        await asyncio.wait_for(coord_task, timeout=5)
+    except Exception:
+        coord_task.cancel()
+
+    # During the high-pending window the backfill batch MUST NOT fire.
+    assert batches_during_pause == 0, (
+        f"backfill started while pending >> HWM (batches={batches_during_pause})")
+    assert state_during_pause["backfill_status"] == "syncing_paused_media_backpressure"
+
+
+@pytest.mark.asyncio
+async def test_backpressure_pause_still_heartbeats(storage, tmp_path, monkeypatch):
+    """Coordinator heartbeat must keep advancing while paused so health does
+    not mislabel the pause as a hang."""
+    from tgparser.collector import Collector
+    from tgparser.media_queue import MediaQueue
+    cid = -1001234567101
+    await storage.upsert_chat({"id": cid, "type": "supergroup", "title": "t"})
+    async with storage.pool.acquire() as c:
+        await c.execute(
+            "INSERT INTO sync_state (chat_id, backfill_status) "
+            "VALUES ($1,'syncing') ON CONFLICT (chat_id) DO NOTHING", cid)
+        await c.execute(
+            "INSERT INTO coordinator_progress (chat_id) "
+            "VALUES ($1) ON CONFLICT (chat_id) DO NOTHING", cid)
+    msgs = [_FakeMsg(i, cid) for i in range(1, 3)]
+    client = _StallingLoopClient(msgs, hang_after=100)
+    mq = MediaQueue(client, storage, base_dir=str(tmp_path),
+                    max_media_mb=10, concurrency=1)
+    coll = Collector(client, storage, mq, {
+        "backfill_batch_size": 10,
+        "backfill_batch_timeout_seconds": 2,
+        "backfill_batch_pause_seconds": 0,
+        "download_media": False,
+        "follow_linked_discussion": False,
+        "participants_sync": False,
+        "media_pending_high_water": 100,
+        "media_pending_low_water": 20,
+    })
+    coll._targets = [cid]
+    async def _p(): return 500
+    async def _d(): return 0
+    monkeypatch.setattr(coll, "_media_pending_count", _p)
+    monkeypatch.setattr(coll, "_media_done_count", _d)
+    coord_task = asyncio.create_task(coll._coordinator_loop())
+    # Wait up to 3s for the coord loop to enter pause and emit first heartbeat.
+    hb1 = None
+    for _ in range(30):
+        await asyncio.sleep(0.1)
+        cp1 = await storage.coordinator_progress_all()
+        rows1 = [r for r in cp1 if r["chat_id"] == cid]
+        if rows1 and rows1[0]["coordinator_heartbeat_at"] is not None:
+            hb1 = rows1[0]["coordinator_heartbeat_at"]
+            break
+    assert hb1 is not None, "coordinator_heartbeat never fired for cid"
+    await asyncio.sleep(2)
+    cp2 = await storage.coordinator_progress_all()
+    rows2 = [r for r in cp2 if r["chat_id"] == cid]
+    hb2 = rows2[0]["coordinator_heartbeat_at"]
+    coll._stop.set()
+    try: await asyncio.wait_for(coord_task, timeout=5)
+    except Exception: coord_task.cancel()
+    assert hb2 >= hb1, "coordinator_heartbeat stopped during backpressure pause"

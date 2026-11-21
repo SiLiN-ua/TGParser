@@ -1081,24 +1081,54 @@ class Storage:
                     ah_applies = new_ah_prio >= prev_ah_prio
 
             # Always record every observed hash in history, even if not active.
+            # v7.3: the whole history write + authoritative users update runs
+            # inside a single transaction so promotion is atomic -- no window
+            # where two rows per (user_id, auth_fingerprint) are both active.
             if new_ah is not None:
-                await con.execute("""
-                    INSERT INTO access_hash_history
-                        (user_id, hash_fingerprint, access_hash, kind, priority,
-                         source, auth_fingerprint, source_chat_id, source_message_id,
-                         first_seen, last_seen, became_active_at, is_active)
-                    VALUES ($1::bigint, $2, $3::bigint, $4, $5, $6, $7, $8, $9,
-                            NOW(), NOW(),
-                            CASE WHEN $10 THEN NOW() END, $10)
-                    ON CONFLICT (user_id, hash_fingerprint, auth_fingerprint)
-                    DO UPDATE SET last_seen=NOW(),
-                        is_active = access_hash_history.is_active OR EXCLUDED.is_active,
-                        became_active_at = COALESCE(access_hash_history.became_active_at,
-                                                     EXCLUDED.became_active_at);
-                """, uid, self._hash_fp(new_ah), new_ah, new_ah_kind, new_ah_prio,
-                     data.get("entity_source"), new_auth_fp,
-                     data.get("source_chat_id"), data.get("source_message_id"),
-                     ah_applies)
+                async with con.transaction():
+                    new_fp = self._hash_fp(new_ah)
+                    # If the incoming hash is going to become active, retire
+                    # every other is_active row for this user. Normative rule
+                    # (v7.3): exactly ONE is_active history row per user
+                    # mirrors the single authoritative users.access_hash slot.
+                    # Rows from a different auth session stay in the append-
+                    # only history (never deleted) but are moved out of
+                    # is_active=TRUE: foreign-session hashes are not usable in
+                    # the current session.
+                    if ah_applies:
+                        await con.execute("""
+                            UPDATE access_hash_history
+                               SET is_active = FALSE,
+                                   replaced_at = NOW(),
+                                   replacement_reason = CASE
+                                     WHEN auth_fingerprint = $2
+                                     THEN 'promotion_by_higher_priority'
+                                     ELSE 'superseded_by_current_session' END
+                             WHERE user_id = $1::bigint
+                               AND is_active = TRUE
+                               AND NOT (hash_fingerprint = $3
+                                        AND auth_fingerprint = $2)
+                        """, uid, new_auth_fp, new_fp)
+                    await con.execute("""
+                        INSERT INTO access_hash_history
+                            (user_id, hash_fingerprint, access_hash, kind, priority,
+                             source, auth_fingerprint, source_chat_id, source_message_id,
+                             first_seen, last_seen, became_active_at, is_active)
+                        VALUES ($1::bigint, $2, $3::bigint, $4, $5, $6, $7, $8, $9,
+                                NOW(), NOW(),
+                                CASE WHEN $10 THEN NOW() END, $10)
+                        ON CONFLICT (user_id, hash_fingerprint, auth_fingerprint)
+                        DO UPDATE SET last_seen=NOW(),
+                            is_active = access_hash_history.is_active OR EXCLUDED.is_active,
+                            became_active_at = COALESCE(access_hash_history.became_active_at,
+                                                         EXCLUDED.became_active_at),
+                            replaced_at = CASE
+                                WHEN access_hash_history.is_active OR EXCLUDED.is_active
+                                THEN NULL ELSE access_hash_history.replaced_at END;
+                    """, uid, new_fp, new_ah, new_ah_kind, new_ah_prio,
+                         data.get("entity_source"), new_auth_fp,
+                         data.get("source_chat_id"), data.get("source_message_id"),
+                         ah_applies)
 
             if prev and new_rank < prev_rank:
                 # downgrade of OVERALL quality: refresh only technical fields.

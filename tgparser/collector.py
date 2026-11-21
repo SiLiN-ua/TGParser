@@ -215,6 +215,25 @@ class Collector:
                             await self.storage.coordinator_heartbeat(cid)
                             if pending < self.media_lw:
                                 break
+                            # v7.2: re-prime the asyncio media queue if workers
+                            # have run dry while DB still holds thousands of
+                            # pending rows. Without this, pending rows left
+                            # behind by a previous crash (seen when the
+                            # startup sweep's limit of 500 caps the re-queue)
+                            # starve workers and deadlock the wait.
+                            try:
+                                q_depth = (self.media_q.queue.qsize()
+                                           + len(self.media_q._inflight))
+                                if q_depth < 50:
+                                    swept = await self.media_q.sweep_retryable(
+                                        limit=50)
+                                    if swept:
+                                        log.info(
+                                            "backpressure: resweep queued %s "
+                                            "items (pending=%s q_depth=%s)",
+                                            swept, pending, q_depth)
+                            except Exception:
+                                log.exception("backpressure resweep failed")
                         await self.storage.set_backfill_status(cid, "syncing")
 
                     # v6: batch with hard timeout + progress watchdog

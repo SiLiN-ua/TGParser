@@ -260,9 +260,16 @@ class MediaQueue:
             "message": msg,
         })
 
-    async def sweep_retryable(self):
-        """Re-enqueue pending/failed media on startup."""
-        rows = await self.storage.media_get_retryable(limit=500)
+    async def sweep_retryable(self, limit: int = 500):
+        """Re-enqueue pending/failed media.
+
+        Called once at startup and, since v7.2, again from the coordinator's
+        backpressure wait when workers have run dry while DB still holds
+        pending rows (otherwise `sweep_retryable`'s startup cap of 500 lets a
+        larger backlog — accumulated across process crashes while items were
+        in the in-memory asyncio.Queue — starve workers and deadlock).
+        """
+        rows = await self.storage.media_get_retryable(limit=limit)
         for r in rows:
             await self.enqueue_by_ref(r["chat_id"], r["message_id"],
                                       r["file_id"], r["media_type"], r["size"])

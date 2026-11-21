@@ -400,3 +400,34 @@ async def test_media_sweep_retries_pending(storage, tmp_path):
     n = await mq.sweep_retryable()
     assert n >= 1
     assert (cid, 10, "photo:99") in enqueued
+
+
+@pytest.mark.asyncio
+async def test_media_sweep_accepts_limit(storage, tmp_path):
+    """v7.2 regression: sweep_retryable honours a caller-provided limit so the
+    coordinator can resweep in small chunks during backpressure. Without the
+    limit arg the method raised TypeError and the backpressure-wait resweep
+    (deadlock mitigation) silently did nothing."""
+    cid = -1002
+    await storage.upsert_chat({"id": cid, "type": "channel", "title": "t"})
+    for mid in range(1, 10):
+        await storage.upsert_message({"chat_id": cid, "message_id": mid})
+        await storage.upsert_media_record({
+            "file_id": f"photo:{mid}", "chat_id": cid, "message_id": mid,
+            "media_type": "photo", "status": "pending", "attempts": 0,
+        })
+
+    enqueued = []
+
+    class _MQ(MediaQueue):
+        async def enqueue_by_ref(self, chat_id, message_id, file_id, media_type, size):
+            enqueued.append(file_id)
+
+    mq = _MQ(FakeClient({}), storage, base_dir=str(tmp_path),
+             max_media_mb=10, concurrency=1)
+    n = await mq.sweep_retryable(limit=3)
+    assert n == 3
+    assert len(enqueued) == 3
+    # A second sweep with the default limit should see the remaining rows.
+    n2 = await mq.sweep_retryable()
+    assert n2 >= 6

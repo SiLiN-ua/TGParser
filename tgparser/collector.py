@@ -163,10 +163,16 @@ class Collector:
             self._coordinator_loop(), name="backfill-coordinator")
 
     async def stop_coordinator(self):
+        # Short budget (5s). The batch loop checks self._stop between messages
+        # and after each page, so it usually exits well before the wait_for
+        # fires. If it doesn't, we cancel: batches commit the checkpoint only
+        # after a batch has finished successfully, so a cancelled batch leaves
+        # sync_state.last_backfilled_message_id untouched (no false-complete
+        # and no advance past an unfinished message).
         self._stop.set()
         if self._coordinator_task:
             try:
-                await asyncio.wait_for(self._coordinator_task, timeout=20)
+                await asyncio.wait_for(self._coordinator_task, timeout=5)
             except Exception:
                 self._coordinator_task.cancel()
                 try:
@@ -493,18 +499,46 @@ class Collector:
         return summary
 
     async def wait_background(self, timeout: float = 20.0):
-        """Wait for all tracked background tasks with a timeout, then cancel."""
+        """Wait for all tracked background tasks with a timeout, then cancel.
+
+        Shutdown contract:
+          - Tasks that finish naturally within `timeout` are kept as-is.
+          - Tasks still pending at `timeout` are cancelled and awaited via
+            asyncio.gather(return_exceptions=True), so one hung task cannot
+            hold up shutdown.
+          - asyncio.CancelledError from cancelled tasks is treated as the
+            NORMAL shutdown outcome and is NOT logged.
+          - Any other exception a background task raised is logged at
+            WARNING, once per task, without leaking out of this method.
+          - The method itself must never raise CancelledError at shutdown:
+            that would short-circuit the rest of teardown in run.py.
+          - Completed tasks are removed from self._bg_tasks.
+        """
         if not self._bg_tasks:
             return
         pending = list(self._bg_tasks)
         done, not_done = await asyncio.wait(pending, timeout=timeout)
         for t in not_done:
             t.cancel()
-        for t in not_done:
-            try:
-                await t
-            except Exception:
-                pass
+        # Gather with return_exceptions=True absorbs CancelledError and any
+        # task-raised exception. Nothing leaves this method.
+        results = await asyncio.gather(*not_done, return_exceptions=True)
+        for t, r in zip(not_done, results):
+            if isinstance(r, asyncio.CancelledError):
+                continue  # expected on shutdown
+            if isinstance(r, BaseException):
+                log.warning("bg task %r raised during shutdown: %r",
+                            t.get_name(), r)
+        # Also inspect tasks that finished before the timeout for real errors.
+        for t in done:
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                log.warning("bg task %r finished with exception: %r",
+                            t.get_name(), exc)
+        # Prune finished tasks from the tracked set.
+        self._bg_tasks = {t for t in self._bg_tasks if not t.done()}
 
     # -- handlers ------------------------------------------------------------
     def _register_handlers(self, chat_ids: list[int]):

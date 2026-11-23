@@ -121,25 +121,64 @@ class MediaQueue:
         for i in range(self.concurrency):
             self._workers.append(asyncio.create_task(self._worker(i), name=f"media-{i}"))
 
-    async def stop(self, timeout: float = 30.0):
+    async def stop(self, timeout: float = 5.0):
+        """Fast, bounded shutdown.
+
+        The queue is durable: every enqueued `media` row is persisted in
+        Postgres with status='pending' before it ever enters the in-memory
+        asyncio.Queue. Draining tens of thousands of in-memory items on
+        shutdown is both unnecessary and unsafe — on restart, sweep_retryable
+        re-enqueues every pending/failed row that still has a message pointer.
+
+        Strategy:
+          1. Stop accepting new items (enqueue/enqueue_by_ref reject).
+          2. Short grace period (`timeout`) so recently-started downloads
+             can write their 'done'/'failed' row naturally.
+          3. Cancel every worker still running (idle on queue.get(), mid
+             download, inside a retry sleep, inside the heartbeat ticker).
+          4. Collect worker tasks via asyncio.gather(return_exceptions=True)
+             so CancelledError and download exceptions are absorbed without
+             tracebacks propagating.
+          5. Drop in-memory items on the floor: the asyncio.Queue is not
+             persisted. The DB rows keep status='pending' and are swept up
+             on next start.
+
+        Guaranteed to return within ~`timeout` + a small cancel budget.
+        No worker task is left pending.
+        """
         self._accepting = False
-        # Drain remaining items with a soft deadline.
-        try:
-            await asyncio.wait_for(self.queue.join(), timeout=timeout)
-        except asyncio.TimeoutError:
-            log.warning("media queue drain timeout after %ss, items left=%s",
-                        timeout, self.queue.qsize())
         self._stop.set()
+
+        # Poke workers blocked on queue.get() so the first one in each slot
+        # can wake and observe _stop / the None sentinel.
         for _ in self._workers:
             try:
                 self.queue.put_nowait(None)
             except Exception:
                 pass
-        for w in self._workers:
-            try:
-                await asyncio.wait_for(w, timeout=10)
-            except Exception:
-                w.cancel()
+
+        # Grace period: wait for workers to finish their current item or
+        # notice the sentinel. Polling avoids queue.join() against a huge
+        # pending queue.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, float(timeout))
+        while loop.time() < deadline:
+            if all(t.done() for t in self._workers):
+                break
+            await asyncio.sleep(0.1)
+
+        # Cancel whatever is still running.
+        for t in self._workers:
+            if not t.done():
+                t.cancel()
+
+        # Collect; return_exceptions=True absorbs CancelledError + any raised
+        # download exception so stop() itself cannot propagate.
+        results = await asyncio.gather(*self._workers, return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                log.debug("media worker exited with exception: %r", r)
+        self._workers.clear()
 
     def _chat_dir(self, chat_id: int) -> Path:
         d = self.base / str(chat_id)
@@ -307,7 +346,7 @@ class MediaQueue:
                                 idx, pid=pid, current_file_id=file_id)
                         except Exception:
                             pass
-            hb_task = asyncio.create_task(_hb_ticker())
+            hb_task = asyncio.create_task(_hb_ticker(), name=f"media-hb-{idx}")
             try:
                 await self._download(item)
                 try:
@@ -315,6 +354,19 @@ class MediaQueue:
                         idx, pid=pid, current_file_id=None, completed_delta=1)
                 except Exception:
                     pass
+            except asyncio.CancelledError:
+                # Worker is being shut down. Make sure the heartbeat task
+                # dies with us so MediaQueue.stop can report zero media-*
+                # pending tasks. No DB bookkeeping here — the media row stays
+                # 'pending' and will be swept on the next start.
+                stop_hb.set()
+                if not hb_task.done():
+                    hb_task.cancel()
+                try:
+                    await hb_task
+                except BaseException:
+                    pass
+                raise
             except Exception as e:
                 # v6: classify expired file reference as 'needs_refresh' so the
                 # coordinator refreshes the Message object instead of looping.

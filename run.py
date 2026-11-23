@@ -179,41 +179,107 @@ async def _main_inner(log: logging.Logger, cfg: dict,
 
     finally:
         log.info("shutting down")
-        for t in (heartbeat_task, tg_heartbeat_task):
-            if t:
-                t.cancel()
+        # The whole teardown runs as a separate task guarded by asyncio.shield,
+        # so even if the outer main task has been cancelled (SIGINT delivered
+        # mid-await, asyncio.Runner cancelling on second Ctrl-C, etc.) the
+        # teardown runs to completion and the final 'stopped' row lands in
+        # Postgres before we exit. Each step catches BaseException (not just
+        # Exception) because asyncio.CancelledError is a BaseException and
+        # must not short-circuit shutdown.
+        async def _teardown():
+            # 1) Mark 'stopping' with the REAL pid. 'stopped' is written only
+            #    at the very end, so a SIGKILL or crash between here and the
+            #    final write leaves the row at 'stopping' with a dead pid,
+            #    which health.py correctly flags as unhealthy.
+            try:
+                _targets = list(collector.ok_targets) if collector else []
+                await storage.set_runtime(os.getpid(), "stopping",
+                                          _targets, note=None)
+            except BaseException:
+                log.exception("set_runtime(stopping) failed")
+
+            # 2) Cancel heartbeat tasks BEFORE any further teardown so they
+            #    cannot race with the final status writes.
+            for t in (heartbeat_task, tg_heartbeat_task):
+                if t:
+                    t.cancel()
+                    try:
+                        await t
+                    except BaseException:
+                        pass
+
+            # 3) Coordinator (~5s budget). Batches advance checkpoint only
+            #    after a successful commit, so cancelling mid-batch leaves
+            #    sync_state.last_backfilled_message_id untouched.
+            if collector:
                 try:
-                    await t
+                    await collector.stop_coordinator()
                 except BaseException:
-                    pass
-        if collector:
+                    log.exception("coordinator stop failed")
+                log.info("coordinator stopped (run.py)")
+                # Background tasks: collector.wait_background cancels anything
+                # still running past 5s, logs real exceptions internally, and
+                # never raises on normal CancelledError-driven shutdown. We
+                # still guard with except BaseException + log.exception in
+                # case of a genuine programming error inside wait_background.
+                try:
+                    await collector.wait_background(timeout=5)
+                except BaseException:
+                    log.exception("wait_background raised unexpectedly")
+                log.info("background tasks stopped")
+
+            # 4) MediaQueue: fast stop. Pending `media` rows stay in Postgres
+            #    and are re-enqueued by sweep_retryable() at next start.
+            if media_q:
+                try:
+                    await media_q.stop(timeout=5)
+                except BaseException:
+                    log.exception("media queue stop failed")
+                log.info("media stopped")
+
+            # 5) Telegram client disconnect — only log success after the
+            #    await returns without raising.
+            if client:
+                disconnected = False
+                try:
+                    await client.disconnect()
+                    disconnected = True
+                except BaseException:
+                    log.exception("client disconnect failed")
+                if disconnected:
+                    log.info("client disconnected")
+
+            # 6) Final 'stopped' + pid=NULL.
             try:
-                await collector.stop_coordinator()
-            except Exception:
-                log.exception("coordinator stop failed")
+                await storage.set_runtime(None, "stopped", [], note=None)
+            except BaseException:
+                log.exception("set_runtime(stopped) failed")
+
+            # 7) Close pool, log bye.
             try:
-                await collector.wait_background(timeout=15)
-            except Exception:
-                log.exception("bg task drain failed")
-        if media_q:
-            try:
-                await media_q.stop(timeout=30)
-            except Exception:
-                log.exception("media queue stop failed")
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
+                await storage.close()
+            except BaseException:
                 pass
+            log.info("bye")
+
+        _td_task = asyncio.ensure_future(_teardown())
         try:
-            await storage.set_runtime(None, "stopped", [], note=None)
-        except Exception:
-            pass
-        try:
-            await storage.close()
-        except Exception:
-            pass
-        log.info("bye")
+            await asyncio.shield(_td_task)
+        except asyncio.CancelledError:
+            # Outer cancellation hit the shield; the teardown task keeps
+            # running. Wait for it in a cancellation-safe way.
+            while not _td_task.done():
+                try:
+                    await asyncio.shield(_td_task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+        except BaseException:
+            try:
+                await _td_task
+            except BaseException:
+                pass
 
 
 async def _main(log: logging.Logger, cfg: dict) -> int:

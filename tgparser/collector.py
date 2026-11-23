@@ -163,12 +163,13 @@ class Collector:
             self._coordinator_loop(), name="backfill-coordinator")
 
     async def stop_coordinator(self):
-        # Short budget (5s). The batch loop checks self._stop between messages
-        # and after each page, so it usually exits well before the wait_for
-        # fires. If it doesn't, we cancel: batches commit the checkpoint only
-        # after a batch has finished successfully, so a cancelled batch leaves
-        # sync_state.last_backfilled_message_id untouched (no false-complete
-        # and no advance past an unfinished message).
+        # backfill() advances the checkpoint after EACH successfully processed
+        # message. It checks self._stop before starting the next message and
+        # before re-opening the iterator, and its FloodWait / transient-retry
+        # waits are stop-aware, so a normal stop returns quickly with status
+        # 'stopped' (never 'complete'). The forced cancel below stays as a
+        # fallback for a network call that does not return within 5s; a
+        # message interrupted by that cancel did not advance the checkpoint.
         self._stop.set()
         if self._coordinator_task:
             try:
@@ -179,6 +180,16 @@ class Collector:
                     await self._coordinator_task
                 except BaseException:
                     pass
+
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        """Sleep up to `seconds`; return True as soon as _stop is set."""
+        if self._stop.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def _coordinator_loop(self):
         log.info(
@@ -299,7 +310,8 @@ class Collector:
                         cid, added, dur, ok, reason)
 
                     if not ok:
-                        await asyncio.sleep(self.recovery_backoff)
+                        if await self._sleep_or_stop(self.recovery_backoff):
+                            break
                         prog = await self._coord_progress_row(cid)
                         if prog and prog.get("consecutive_batch_failures", 0) >= self.max_consecutive_failures:
                             log.error("target %s DEGRADED after %s consecutive failures",
@@ -322,6 +334,11 @@ class Collector:
                                 self._stop.wait(), timeout=self.batch_pause)
                         except asyncio.TimeoutError:
                             pass
+
+                # Shutdown requested during the target loop: skip the
+                # post-round maintenance (it makes Telegram calls) and exit.
+                if self._stop.is_set():
+                    break
 
                 # v5: user profile queue drain
                 try:
@@ -637,15 +654,26 @@ class Collector:
         Returns (added:int, status:str, more:bool). `more` is True iff the
         batch was capped by batch_size (implying more messages likely remain).
         """
+        # Shutdown already requested: start no Telegram call and no DB query.
+        if self._stop.is_set():
+            log.info("backfill chat=%s skipped: shutdown in progress", chat_id)
+            return (0, "stopped", False)
         entity = await self.client.get_entity(chat_id)
         limit = batch_size if batch_size is not None else self.batch_size
         count_total = 0
         stopped_on_limit = False
+        stopped = False
+        last_id = None
+        first_id = None
         # (Re-)read pending floor from DB.
         pending_floor = await self.storage.backfill_queue_min_pending(chat_id)
         self._pending_floor[chat_id] = pending_floor
 
         while True:
+            # Never (re-)open the iterator once shutdown has been requested.
+            if self._stop.is_set():
+                stopped = True
+                break
             state = await self.storage.get_sync_state(chat_id)
             min_id = int(state["last_backfilled_message_id"] or 0) if state else 0
             first_id = state["first_message_id"] if state else None
@@ -659,6 +687,11 @@ class Collector:
             last_id = min_id
             try:
                 async for msg in self.client.iter_messages(entity, min_id=min_id, reverse=True):
+                    # Checked before starting the next message: a message that
+                    # was not started is not processed and not checkpointed.
+                    if self._stop.is_set():
+                        stopped = True
+                        break
                     ok = await self._process_backfill_message(chat_id, msg)
                     if ok:
                         last_id = max(last_id, msg.id)
@@ -672,27 +705,43 @@ class Collector:
                             await self.storage.coordinator_batch_progress(
                                 chat_id, last_id)
                     if run_count and run_count % 100 == 0:
-                        await asyncio.sleep(0.3)
+                        if await self._sleep_or_stop(0.3):
+                            stopped = True
+                            break
                     if limit and count_total >= limit:
                         stopped_on_limit = True
                         break
-                # natural end of iterator
+                # natural end of iterator (or stop / limit break above)
                 break
             except errors.FloodWaitError as e:
                 wait = min(int(e.seconds) + 2, 3600)
                 log.warning("backfill FloodWait %ss on %s; resuming after sleep", wait, chat_id)
                 # Checkpoint whatever we accrued, then sleep and re-open the iterator.
                 await self._advance_checkpoint(chat_id, last_id, first_id)
-                await asyncio.sleep(wait)
+                if await self._sleep_or_stop(wait):
+                    stopped = True
+                    break
                 continue
             except (errors.RPCError, errors.ServerError, ConnectionError, OSError) as e:
                 log.warning("backfill transient %s on %s; retry in 5s", type(e).__name__, chat_id)
                 await self._advance_checkpoint(chat_id, last_id, first_id)
-                await asyncio.sleep(5 + random.uniform(0, 2))
+                if await self._sleep_or_stop(5 + random.uniform(0, 2)):
+                    stopped = True
+                    break
                 continue
 
             if stopped_on_limit:
                 break
+
+        if stopped or self._stop.is_set():
+            # Shutdown: keep the checkpoint of the last successfully processed
+            # message, do NOT classify the batch (never 'complete'), do NOT
+            # touch backfill_status/target_state, and let the coordinator exit.
+            if last_id is not None:
+                await self._advance_checkpoint(chat_id, last_id, first_id)
+            log.info("backfill chat=%s stopped by shutdown; processed=%s, checkpoint kept",
+                     chat_id, count_total)
+            return (count_total, "stopped", False)
 
         await self._advance_checkpoint(chat_id, last_id, first_id)
         pending_floor = await self.storage.backfill_queue_min_pending(chat_id)

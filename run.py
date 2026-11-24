@@ -91,6 +91,35 @@ async def _db_heartbeat_loop(storage, stop: asyncio.Event, interval: int = 15):
             pass
 
 
+async def _init_v11_legacy(storage, log: logging.Logger) -> None:
+    """Runs before any Telegram connect or collector write.
+
+    With schema v11 this legacy process must record dyn_engine=FALSE, so a
+    stale TRUE from a previous dynamic process cannot leave the guard armed
+    against legacy writes (or, worse, pretend a dynamic engine is running).
+    Failure is fatal. Below v11 there is nothing to initialise."""
+    try:
+        version = await storage.schema_version()
+    except Exception as e:
+        raise StartupError(f"schema version unavailable: {type(e).__name__}")
+    if version < 11:
+        return
+    if await storage.dynamic_gate_enabled():
+        log.warning("deployment gate 'dynamic_targets' is on, but this build "
+                    "runs only the legacy engine")
+    try:
+        await storage.set_runtime_dynamic_engine(False)
+    except Exception as e:
+        log.error("could not record dyn_engine=false: %s", type(e).__name__)
+        raise StartupError("dyn_engine=false not recorded")
+    try:
+        n = await storage.recover_stale_discovery_runs()
+        if n:
+            log.warning("marked %s stale discovery run(s) failed", n)
+    except Exception as e:
+        log.warning("stale discovery recovery skipped: %s", type(e).__name__)
+
+
 async def _main_inner(log: logging.Logger, cfg: dict,
                       lock: ProcessLock, stop: asyncio.Event) -> int:
     storage = Storage(cfg["postgres"]["dsn"])
@@ -106,6 +135,8 @@ async def _main_inner(log: logging.Logger, cfg: dict,
             log.error("postgres connect failed: %s", e)
             raise StartupError("postgres unavailable")
         await apply_migrations(storage.pool, "migrations")
+
+        await _init_v11_legacy(storage, log)
 
         client = make_client(cfg)
         try:

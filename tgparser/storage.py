@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
+import re
 import random
 import traceback
 from datetime import datetime, timezone
@@ -1509,3 +1512,617 @@ class Storage:
                         "UPDATE messages SET webpage = COALESCE(webpage, $3::jsonb) "
                         "WHERE chat_id=$1 AND message_id=$2",
                         chat_id, message_id, _j(raw))
+
+    # ========================================================================
+    # v11 (draft): dynamic targets foundation. Every method here requires
+    # schema_version() >= 11; callers check that first. The dynamic engine
+    # itself is not wired up yet.
+    # ========================================================================
+
+    @_with_db_retry()
+    async def schema_version(self) -> int:
+        """max(schema_migrations.version); 0 if the table does not exist."""
+        async with self.pool.acquire() as con:
+            exists = await con.fetchval(
+                "SELECT to_regclass('public.schema_migrations') IS NOT NULL")
+            if not exists:
+                return 0
+            v = await con.fetchval("SELECT max(version) FROM schema_migrations")
+            return int(v or 0)
+
+    # --- gate / running engine ---------------------------------------------
+    @_with_db_retry()
+    async def dynamic_gate_enabled(self) -> bool:
+        async with self.pool.acquire() as con:
+            exists = await con.fetchval(
+                "SELECT to_regclass('public.deployment_gates') IS NOT NULL")
+            if not exists:
+                return False
+            v = await con.fetchval(
+                "SELECT enabled FROM deployment_gates WHERE key='dynamic_targets'")
+            return v is True
+
+    @_with_db_retry()
+    async def set_runtime_dynamic_engine(self, on: bool) -> None:
+        """Record the engine this process actually runs. Raises if the value
+        could not be written and read back, so callers can fail closed."""
+        want = bool(on)
+        async with self.pool.acquire() as con:
+            got = await con.fetchval(
+                "INSERT INTO runtime_state (id, dyn_engine, dyn_engine_set_at) "
+                "VALUES (1, $1, NOW()) "
+                "ON CONFLICT (id) DO UPDATE SET dyn_engine=EXCLUDED.dyn_engine, "
+                "  dyn_engine_set_at=EXCLUDED.dyn_engine_set_at "
+                "RETURNING dyn_engine", want)
+        if got is not want:
+            raise RuntimeError("runtime_state.dyn_engine write not confirmed")
+
+    # --- intent: config / preferences / rules -------------------------------
+    @_with_db_retry()
+    async def get_collection_config(self) -> dict:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("SELECT * FROM collection_config WHERE id=1")
+            return dict(row) if row else {}
+
+    @_with_db_retry()
+    async def get_target_preference(self, chat_id: int) -> asyncpg.Record | None:
+        async with self.pool.acquire() as con:
+            return await con.fetchrow(
+                "SELECT * FROM target_preferences WHERE chat_id=$1", chat_id)
+
+    @_with_db_retry()
+    async def upsert_target_preference(self, chat_id: int, *,
+                                       selected: bool | None = None,
+                                       excluded: bool | None = None,
+                                       note: str | None = None,
+                                       updated_by: str = "ui"):
+        """Patch one preference in a single statement (one policy bump at
+        most). Unspecified fields keep their current value."""
+        if selected is True and excluded is True:
+            raise ValueError("selected and excluded cannot both be true")
+        if note is not None and len(note) > 500:
+            raise ValueError("note too long")
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO target_preferences "
+                "  (chat_id, selected, excluded, note, updated_at, updated_by) "
+                "VALUES ($1, COALESCE($2, FALSE), COALESCE($3, FALSE), $4, NOW(), $5) "
+                "ON CONFLICT (chat_id) DO UPDATE SET "
+                "  selected = COALESCE($2, target_preferences.selected), "
+                "  excluded = COALESCE($3, target_preferences.excluded), "
+                "  note = COALESCE($4, target_preferences.note), "
+                "  updated_at = NOW(), updated_by = $5",
+                chat_id, selected, excluded, note, updated_by[:80])
+
+    @_with_db_retry()
+    async def list_title_exclude_rules(self) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as con:
+            return await con.fetch(
+                "SELECT id, pattern, created_at, created_by "
+                "FROM collection_title_rules WHERE action='exclude' ORDER BY id")
+
+    # --- discovery: request / claim -----------------------------------------
+    DISCOVERY_MIN_SPACING_SEC = 60
+
+    @_with_db_retry()
+    async def request_discovery(self, requested_by: str = "ui") -> int:
+        async with self.pool.acquire() as con:
+            return int(await con.fetchval(
+                "UPDATE discovery_control "
+                "SET requested_seq = requested_seq + 1, "
+                "    last_requested_at = NOW(), last_requested_by = $1 "
+                "WHERE id=1 RETURNING requested_seq", requested_by[:80]))
+
+    @_with_db_retry()
+    async def claim_discovery_run(self, trigger_kind: str) -> int | None:
+        """Create the one and only running discovery run, or return None.
+
+        Single transaction under discovery_control FOR UPDATE:
+          1. any run still 'running' (live or crashed) -> None;
+          2. next_allowed_at in the future -> None;
+          3. trigger 'request' with nothing pending -> None;
+          4. INSERT run; for 'request' consume requested_seq; set last_run_id
+             and next_allowed_at = NOW() + min spacing; commit.
+        An INSERT failure rolls back the whole transaction, so the request is
+        not consumed. The partial unique index uq_ddr_one_running backs (1)."""
+        if trigger_kind not in ("scheduled", "request", "startup"):
+            raise ValueError(f"bad trigger_kind {trigger_kind!r}")
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ctl = await con.fetchrow(
+                    "SELECT requested_seq, consumed_seq, "
+                    "       (next_allowed_at IS NOT NULL AND next_allowed_at > NOW()) AS throttled "
+                    "FROM discovery_control WHERE id=1 FOR UPDATE")
+                if await con.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM dialog_discovery_runs "
+                        "WHERE status='running')"):
+                    return None
+                if ctl["throttled"]:
+                    return None
+                if trigger_kind == "request" and ctl["requested_seq"] <= ctl["consumed_seq"]:
+                    return None
+                run_id = await con.fetchval(
+                    "INSERT INTO dialog_discovery_runs (status, trigger_kind) "
+                    "VALUES ('running', $1) RETURNING id", trigger_kind)
+                await con.execute(
+                    "UPDATE discovery_control SET "
+                    "  consumed_seq = CASE WHEN $2 THEN requested_seq ELSE consumed_seq END, "
+                    "  last_consumed_at = CASE WHEN $2 THEN NOW() ELSE last_consumed_at END, "
+                    "  last_run_id = $1, "
+                    "  next_allowed_at = NOW() + make_interval(secs => $3) "
+                    "WHERE id=1",
+                    run_id, trigger_kind == "request", float(self.DISCOVERY_MIN_SPACING_SEC))
+                return int(run_id)
+
+    # --- discovery: staging --------------------------------------------------
+    _CATEGORIES = frozenset({"megagroup", "channel", "group", "private",
+                             "bot", "saved", "unknown", "forbidden"})
+
+    @_with_db_retry()
+    async def stage_discovery_items(self, run_id: int, items: list[dict]) -> int:
+        """Write dialogs seen by the current run into staging only. Live
+        discovered_dialogs and the policy version are untouched. Returns the
+        number of rows staged (0 if the run is not running)."""
+        ids, cats, titles, users, arch, parts = [], [], [], [], [], []
+        for it in items:
+            cat = it.get("category")
+            ids.append(int(it["chat_id"]))
+            cats.append(cat if cat in self._CATEGORIES else "unknown")
+            t = it.get("title")
+            u = it.get("username")
+            titles.append(t[:256] if t else None)
+            users.append(u[:64] if u else None)
+            arch.append(bool(it.get("is_archived")))
+            pc = it.get("participants_count")
+            parts.append(int(pc) if pc is not None else None)
+        if not ids:
+            return 0
+        async with self.pool.acquire() as con:
+            res = await con.execute(
+                "INSERT INTO dialog_discovery_items "
+                "  (run_id, chat_id, category, title, username, is_archived, participants_count) "
+                "SELECT $1, u.chat_id, u.category, u.title, u.username, u.is_archived, u.pc "
+                "FROM unnest($2::bigint[], $3::text[], $4::text[], $5::text[], "
+                "            $6::bool[], $7::int[]) "
+                "     AS u(chat_id, category, title, username, is_archived, pc) "
+                "WHERE EXISTS (SELECT 1 FROM dialog_discovery_runs "
+                "              WHERE id=$1 AND status='running') "
+                "ON CONFLICT (run_id, chat_id) DO UPDATE SET "
+                "  category=EXCLUDED.category, title=EXCLUDED.title, "
+                "  username=EXCLUDED.username, is_archived=EXCLUDED.is_archived, "
+                "  participants_count=EXCLUDED.participants_count, staged_at=NOW()",
+                run_id, ids, cats, titles, users, arch, parts)
+            return int(res.split()[-1])
+
+    @_with_db_retry()
+    async def mark_discovery_pass_done(self, run_id: int, pass_kind: str) -> bool:
+        if pass_kind not in ("normal", "archived"):
+            raise ValueError("pass_kind must be 'normal' or 'archived'")
+        col = "normal_pass_done" if pass_kind == "normal" else "archived_pass_done"
+        async with self.pool.acquire() as con:
+            r = await con.fetchval(
+                f"UPDATE dialog_discovery_runs SET {col}=TRUE "
+                "WHERE id=$1 AND status='running' RETURNING id", run_id)
+            return r is not None
+
+    # --- discovery: finish ---------------------------------------------------
+    @_with_db_retry()
+    async def finish_discovery_run_success(self, run_id: int) -> dict:
+        """Publish the staged snapshot atomically. Gone is computed here as
+        (live, not already gone) minus (full staged snapshot); callers cannot
+        pass gone ids. Returns {applied, reason, requested_version, seen,
+        gone}. A run that is not 'running' or lacks a pass is not applied
+        and does not bump the version."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                run = await con.fetchrow(
+                    "SELECT status, normal_pass_done, archived_pass_done "
+                    "FROM dialog_discovery_runs WHERE id=$1 FOR UPDATE", run_id)
+                ver = await con.fetchval(
+                    "SELECT requested_version FROM policy_state WHERE id=1")
+                if run is None:
+                    return {"applied": False, "reason": "no_such_run",
+                            "requested_version": int(ver), "seen": 0, "gone": 0}
+                if run["status"] != "running":
+                    return {"applied": False, "reason": f"status_{run['status']}",
+                            "requested_version": int(ver), "seen": 0, "gone": 0}
+                if not (run["normal_pass_done"] and run["archived_pass_done"]):
+                    return {"applied": False, "reason": "pass_incomplete",
+                            "requested_version": int(ver), "seen": 0, "gone": 0}
+                seen = int(await con.fetchval(
+                    "WITH m AS ("
+                    "  INSERT INTO discovered_dialogs AS d "
+                    "    (chat_id, category, title, username, is_archived, "
+                    "     participants_count, last_seen_run_id, first_seen_at, "
+                    "     last_seen_at, gone_at) "
+                    "  SELECT chat_id, category, title, username, is_archived, "
+                    "         participants_count, run_id, NOW(), NOW(), NULL "
+                    "  FROM dialog_discovery_items WHERE run_id=$1 "
+                    "  ON CONFLICT (chat_id) DO UPDATE SET "
+                    "    category=EXCLUDED.category, title=EXCLUDED.title, "
+                    "    username=EXCLUDED.username, is_archived=EXCLUDED.is_archived, "
+                    "    participants_count=EXCLUDED.participants_count, "
+                    "    last_seen_run_id=EXCLUDED.last_seen_run_id, "
+                    "    last_seen_at=NOW(), gone_at=NULL "
+                    "  RETURNING 1) SELECT COUNT(*) FROM m", run_id))
+                gone = int(await con.fetchval(
+                    "WITH g AS ("
+                    "  UPDATE discovered_dialogs d SET gone_at=NOW() "
+                    "  WHERE d.gone_at IS NULL AND NOT EXISTS ("
+                    "    SELECT 1 FROM dialog_discovery_items i "
+                    "    WHERE i.run_id=$1 AND i.chat_id=d.chat_id) "
+                    "  RETURNING 1) SELECT COUNT(*) FROM g", run_id))
+                await con.execute(
+                    "UPDATE dialog_discovery_runs SET status='complete', "
+                    "  finished_at=NOW(), dialogs_seen=$2, gone_detected=$3 "
+                    "WHERE id=$1", run_id, seen, gone)
+                await con.execute(
+                    "DELETE FROM dialog_discovery_items WHERE run_id=$1", run_id)
+                new_ver = await con.fetchval(
+                    "UPDATE policy_state SET requested_version=requested_version+1, "
+                    "  requested_at=NOW() WHERE id=1 RETURNING requested_version")
+                return {"applied": True, "reason": "complete",
+                        "requested_version": int(new_ver), "seen": seen, "gone": gone}
+
+    STAGING_RETAIN_FAILED_RUNS = 3
+
+    @_with_db_retry()
+    async def finish_discovery_run_fail(self, run_id: int, reason: str,
+                                        cancelled: bool = False,
+                                        retry_after_sec: int | None = None) -> bool:
+        """Mark a running run failed/cancelled. Live snapshot, gone_at and
+        policy version are untouched. Staging of the newest few failed runs
+        is kept for diagnostics; older staging is pruned."""
+        status = "cancelled" if cancelled else "failed"
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                r = await con.fetchval(
+                    "UPDATE dialog_discovery_runs SET status=$2, finished_at=NOW(), "
+                    "  error=$3 WHERE id=$1 AND status='running' RETURNING id",
+                    run_id, status, (reason or "")[:500])
+                if r is None:
+                    return False
+                if retry_after_sec:
+                    await con.execute(
+                        "UPDATE discovery_control SET next_allowed_at = GREATEST("
+                        "  COALESCE(next_allowed_at, NOW()), "
+                        "  NOW() + make_interval(secs => $1)) WHERE id=1",
+                        float(retry_after_sec))
+                await con.execute(
+                    "DELETE FROM dialog_discovery_items i USING dialog_discovery_runs r "
+                    "WHERE i.run_id=r.id AND r.status IN ('failed','cancelled') "
+                    "  AND r.id NOT IN (SELECT id FROM dialog_discovery_runs "
+                    "    WHERE status IN ('failed','cancelled') "
+                    "    ORDER BY id DESC LIMIT $1)",
+                    self.STAGING_RETAIN_FAILED_RUNS)
+                return True
+
+    @_with_db_retry()
+    async def recover_stale_discovery_runs(self) -> int:
+        """Startup only: a 'running' row belongs to a dead process. Mark it
+        failed and drop its claim spacing so a fresh run can be claimed."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                n = int(await con.fetchval(
+                    "WITH upd AS ("
+                    "  UPDATE dialog_discovery_runs SET status='failed', "
+                    "    finished_at=NOW(), error='stale: process restart while running' "
+                    "  WHERE status='running' RETURNING 1) SELECT COUNT(*) FROM upd"))
+                if n:
+                    await con.execute(
+                        "UPDATE discovery_control SET next_allowed_at=NULL WHERE id=1")
+                return n
+
+    @_with_db_retry()
+    async def get_discovery_control(self) -> asyncpg.Record | None:
+        async with self.pool.acquire() as con:
+            return await con.fetchrow("SELECT * FROM discovery_control WHERE id=1")
+
+    # --- policy version -------------------------------------------------------
+    @_with_db_retry()
+    async def get_policy_state(self) -> asyncpg.Record | None:
+        async with self.pool.acquire() as con:
+            return await con.fetchrow("SELECT * FROM policy_state WHERE id=1")
+
+    @_with_db_retry()
+    async def apply_policy_version(self, version: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE policy_state SET applied_version = GREATEST(applied_version, $1), "
+                "  applied_at = NOW() WHERE id=1 AND $1 <= requested_version",
+                int(version))
+
+    # --- mass-gone block ------------------------------------------------------
+    @staticmethod
+    def _gone_fingerprint(chat_ids) -> str:
+        ids = sorted({int(x) for x in chat_ids})
+        return hashlib.sha256(",".join(str(i) for i in ids).encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _should_mass_block(gone_count: int, active_count: int) -> bool:
+        """block if gone_count > 5 OR gone_count * 5 > active_count;
+        active_count == 0 never blocks. 100 active / 20 gone -> True."""
+        if active_count <= 0:
+            return False
+        return gone_count > 5 or gone_count * 5 > active_count
+
+    _GONE_SET_SQL = (
+        "SELECT ts.chat_id FROM target_state ts "
+        "JOIN discovered_dialogs d ON d.chat_id = ts.chat_id "
+        "WHERE ts.enabled = TRUE AND d.gone_at IS NOT NULL ORDER BY ts.chat_id")
+
+    @_with_db_retry()
+    async def evaluate_mass_gone_block(self) -> dict:
+        """Compute the gone set (enabled targets whose dialog is gone) inside
+        the transaction and update the CURRENT block. Confirmation is valid
+        only for the exact (requested_version, fingerprint). Returns
+        {state: none|blocked|confirmed, version, fingerprint, gone, active}."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ps = await con.fetchrow("SELECT * FROM policy_state WHERE id=1 FOR UPDATE")
+                ver = int(ps["requested_version"])
+                gone_ids = [r["chat_id"] for r in await con.fetch(self._GONE_SET_SQL)]
+                active = int(await con.fetchval(
+                    "SELECT COUNT(*) FROM target_state WHERE enabled=TRUE"))
+                fp = self._gone_fingerprint(gone_ids)
+                out = {"version": ver, "fingerprint": fp,
+                       "gone": len(gone_ids), "active": active}
+                if not self._should_mass_block(len(gone_ids), active):
+                    if ps["blocked_version"] is not None:
+                        await self._clear_block(con, ps, "collector")
+                    return {**out, "state": "none"}
+                if ps["confirmed_version"] == ver and ps["confirmed_fingerprint"] == fp:
+                    return {**out, "state": "confirmed"}
+                if not (ps["blocked_version"] == ver and ps["blocked_fingerprint"] == fp):
+                    await con.execute(
+                        "UPDATE policy_state SET blocked_version=$1, blocked_reason='mass_gone', "
+                        "  blocked_count=$2, blocked_fingerprint=$3, blocked_at=NOW() WHERE id=1",
+                        ver, len(gone_ids), fp)
+                    await con.execute(
+                        "INSERT INTO policy_block_history "
+                        "(event, policy_version, fingerprint, gone_count, active_count, actor) "
+                        "VALUES ('blocked',$1,$2,$3,$4,'collector')",
+                        ver, fp, len(gone_ids), active)
+                return {**out, "state": "blocked"}
+
+    @staticmethod
+    async def _clear_block(con, ps, actor: str):
+        await con.execute(
+            "UPDATE policy_state SET blocked_version=NULL, blocked_reason=NULL, "
+            "  blocked_count=NULL, blocked_fingerprint=NULL, blocked_at=NULL WHERE id=1")
+        await con.execute(
+            "INSERT INTO policy_block_history "
+            "(event, policy_version, fingerprint, gone_count, actor) "
+            "VALUES ('cleared',$1,$2,$3,$4)",
+            ps["blocked_version"], ps["blocked_fingerprint"], ps["blocked_count"], actor)
+
+    @_with_db_retry()
+    async def confirm_mass_gone(self, policy_version: int, fingerprint: str,
+                                confirmed_by: str = "admin_cli") -> bool:
+        """Confirm the CURRENT block, only if (version, fingerprint) match it
+        exactly. Previous confirmations are overwritten in policy_state but
+        remain in policy_block_history."""
+        if confirmed_by != "admin_cli":
+            raise ValueError("only admin_cli may confirm")
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ps = await con.fetchrow("SELECT * FROM policy_state WHERE id=1 FOR UPDATE")
+                if (ps["blocked_version"] != policy_version
+                        or ps["blocked_fingerprint"] != fingerprint
+                        or ps["requested_version"] != policy_version):
+                    return False
+                await con.execute(
+                    "UPDATE policy_state SET confirmed_version=$1, confirmed_fingerprint=$2, "
+                    "  confirmed_at=NOW(), confirmed_by=$3 WHERE id=1",
+                    policy_version, fingerprint, confirmed_by)
+                await con.execute(
+                    "INSERT INTO policy_block_history "
+                    "(event, policy_version, fingerprint, gone_count, actor) "
+                    "VALUES ('confirmed',$1,$2,$3,'admin_cli')",
+                    policy_version, fingerprint, ps["blocked_count"])
+                return True
+
+    @_with_db_retry()
+    async def clear_mass_gone_block(self, policy_version: int, fingerprint: str,
+                                    actor: str = "collector") -> bool:
+        """Clear the CURRENT block (e.g. once the confirmed version is
+        applied). Exact match required; confirmation fields and history stay."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ps = await con.fetchrow("SELECT * FROM policy_state WHERE id=1 FOR UPDATE")
+                if (ps["blocked_version"] != policy_version
+                        or ps["blocked_fingerprint"] != fingerprint):
+                    return False
+                await self._clear_block(con, ps, actor)
+                return True
+
+    @staticmethod
+    def mass_gone_state(ps) -> str:
+        """none | blocked | confirmed, from a policy_state row. Confirmation
+        counts only for the current block of the CURRENT requested_version;
+        a block left behind by a newer policy change reads as blocked until
+        the next evaluate_mass_gone_block() refreshes or clears it."""
+        if ps is None or ps["blocked_version"] is None:
+            return "none"
+        if (ps["blocked_version"] == ps["requested_version"]
+                and ps["confirmed_version"] == ps["blocked_version"]
+                and ps["confirmed_fingerprint"] == ps["blocked_fingerprint"]):
+            return "confirmed"
+        return "blocked"
+
+    # --- YAML import -----------------------------------------------------------
+    @staticmethod
+    def _yaml_target(raw: str) -> str:
+        raw = (raw or "").strip()
+        if not 1 <= len(raw) <= 300 or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+            raise ValueError("bad yaml target")
+        return raw
+
+    @staticmethod
+    def _error_class(name: str) -> str:
+        name = re.sub(r"[^A-Za-z0-9_.:]", "_", name or "Error")[:120]
+        return name or "Error"
+
+    @_with_db_retry()
+    async def yaml_import_upsert(self, raw_target: str) -> int:
+        """YAML only adds. An existing row keeps its status (a target removed
+        in the UI and marked terminal never resurrects)."""
+        t = self._yaml_target(raw_target)
+        async with self.pool.acquire() as con:
+            return int(await con.fetchval(
+                "WITH ins AS (INSERT INTO yaml_target_imports (raw_target) VALUES ($1) "
+                "  ON CONFLICT (raw_target) DO NOTHING RETURNING id) "
+                "SELECT id FROM ins UNION ALL "
+                "SELECT id FROM yaml_target_imports WHERE raw_target=$1 LIMIT 1", t))
+
+    @_with_db_retry()
+    async def yaml_import_record_error(self, raw_target: str, error_class: str,
+                                       next_retry_at=None):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE yaml_target_imports SET attempts=LEAST(attempts+1, 1000), "
+                "  last_error_class=$2, last_attempt_at=NOW(), next_retry_at=$3, "
+                "  status='retry' WHERE raw_target=$1 AND status IN ('pending','retry')",
+                self._yaml_target(raw_target), self._error_class(error_class), next_retry_at)
+
+    @_with_db_retry()
+    async def yaml_import_mark_selected(self, raw_target: str, resolved_chat_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE yaml_target_imports SET status='selected', resolved_chat_id=$2, "
+                "  resolved_at=NOW() WHERE raw_target=$1 AND status IN ('pending','retry')",
+                self._yaml_target(raw_target), int(resolved_chat_id))
+
+    @_with_db_retry()
+    async def yaml_import_mark_terminal(self, raw_target: str, error_class: str):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE yaml_target_imports SET status='terminal', last_error_class=$2, "
+                "  last_attempt_at=NOW() WHERE raw_target=$1",
+                self._yaml_target(raw_target), self._error_class(error_class))
+
+    # --- UI audit ----------------------------------------------------------------
+    AUDIT_ACTORS = frozenset({"ui", "admin_cli", "system"})
+    AUDIT_OUTCOMES = frozenset({"ok", "rejected", "error"})
+    AUDIT_DETAIL_KEYS = frozenset({
+        "chat_id", "field", "old", "new", "mode", "category", "rule_id",
+        "pattern_len", "version", "seq", "service_action", "count", "reason",
+        "status_code"})
+    _AUDIT_ACTION_RX = re.compile(r"^[a-z][a-z0-9_.:-]{1,63}$")
+    _SECRETISH_RX = re.compile(r"(postgres(ql)?://|api_hash|access_hash|session|"
+                               r"password|token|\+?\d{10,15}$)", re.I)
+
+    @classmethod
+    def _audit_detail(cls, detail: dict | None) -> dict:
+        out = {}
+        for k, v in (detail or {}).items():
+            if k not in cls.AUDIT_DETAIL_KEYS:
+                raise ValueError(f"audit detail key not allowed: {k!r}")
+            if v is not None and not isinstance(v, (bool, int, float, str)):
+                raise ValueError(f"audit detail value must be scalar: {k!r}")
+            if isinstance(v, str):
+                if len(v) > 120:
+                    raise ValueError(f"audit detail value too long: {k!r}")
+                if cls._SECRETISH_RX.search(v):
+                    raise ValueError(f"audit detail value looks sensitive: {k!r}")
+            out[k] = v
+        return out
+
+    @_with_db_retry()
+    async def ui_audit(self, actor: str, action: str, outcome: str,
+                       detail: dict | None = None, client_ip: str | None = None,
+                       user_agent: str | None = None, error: str | None = None):
+        """Bounded audit record. Only whitelisted scalar detail keys; never a
+        request body. Oversized or malformed values raise instead of being
+        silently truncated past the DB constraints."""
+        if actor not in self.AUDIT_ACTORS:
+            raise ValueError("bad audit actor")
+        if outcome not in self.AUDIT_OUTCOMES:
+            raise ValueError("bad audit outcome")
+        if not self._AUDIT_ACTION_RX.match(action or ""):
+            raise ValueError("bad audit action")
+        d = self._audit_detail(detail)
+        ip = str(ipaddress.ip_address(client_ip)) if client_ip else None
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO ui_audit_log "
+                "(actor, action, outcome, detail, client_ip, user_agent, error) "
+                "VALUES ($1,$2,$3,$4::jsonb,$5::inet,$6,$7)",
+                actor, action, outcome, json.dumps(d, ensure_ascii=False), ip,
+                (user_agent[:200] if user_agent else None),
+                (error[:500] if error else None))
+
+    # --- read-only policy dry-run -------------------------------------------------
+    async def policy_dry_run(self) -> dict:
+        """READ ONLY transaction: compares v_target_policy with target_state.
+        Never writes runtime, policy, discovery or targets."""
+        async with self.pool.acquire() as con:
+            async with con.transaction(readonly=True):
+                schema = int(await con.fetchval(
+                    "SELECT COALESCE(max(version),0) FROM schema_migrations"))
+                gate = (await con.fetchval(
+                    "SELECT enabled FROM deployment_gates WHERE key='dynamic_targets'")) is True
+                rt = await con.fetchrow("SELECT dyn_engine, pid, status FROM runtime_state WHERE id=1")
+                engine = bool(rt and rt["dyn_engine"])
+                cfg = await con.fetchrow("SELECT * FROM collection_config WHERE id=1")
+                ps = await con.fetchrow("SELECT * FROM policy_state WHERE id=1")
+                any_complete = await con.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM dialog_discovery_runs WHERE status='complete')")
+                rows = await con.fetch("SELECT * FROM v_target_policy ORDER BY chat_id")
+                gone_ids = [r["chat_id"] for r in await con.fetch(self._GONE_SET_SQL)]
+                active = int(await con.fetchval(
+                    "SELECT COUNT(*) FROM target_state WHERE enabled=TRUE"))
+        would_enable, would_disable = [], []
+        reasons: dict[str, int] = {}
+        keep = 0
+        for r in rows:
+            reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+            item = {k: r[k] for k in ("chat_id", "category", "title", "discovered",
+                                      "has_preference", "selected", "excluded",
+                                      "in_target_state", "current_enabled",
+                                      "reason", "desired")}
+            if r["desired"] and not r["current_enabled"]:
+                would_enable.append(item)
+            elif r["current_enabled"] and not r["desired"]:
+                would_disable.append(item)
+            else:
+                keep += 1
+        mode = cfg["mode"]
+        awaiting = mode == "all" and not any_complete
+        block_state = self.mass_gone_state(ps)
+        mass_rule = self._should_mass_block(len(gone_ids), active)
+        suppressed = []
+        if awaiting:
+            suppressed.append("awaiting_discovery")
+        if block_state == "blocked" or (mass_rule and block_state == "none"):
+            suppressed.append("mass_gone_block")
+        return {
+            "schema_version": schema,
+            "gate_enabled": gate,
+            "engine_active": engine,
+            "requires_restart": gate != engine,
+            "mode": mode,
+            "include_archived": bool(cfg["include_archived"]),
+            "requested_version": int(ps["requested_version"]),
+            "applied_version": int(ps["applied_version"]),
+            "awaiting_discovery": awaiting,
+            "block": {
+                "state": block_state,
+                "blocked_version": ps["blocked_version"],
+                "blocked_count": ps["blocked_count"],
+                "blocked_fingerprint": ps["blocked_fingerprint"],
+                "confirmed_version": ps["confirmed_version"],
+                "rule_would_block_now": mass_rule,
+                "gone_enabled_count": len(gone_ids),
+                "active_count": active,
+            },
+            "disable_suppressed_by": suppressed,
+            "would_enable": would_enable,
+            "would_disable": would_disable,
+            "would_keep_count": keep,
+            "reason_counts": reasons,
+            "enabled_without_discovery": [r["chat_id"] for r in rows
+                                          if r["current_enabled"] and not r["discovered"]],
+            "enabled_without_preference": [r["chat_id"] for r in rows
+                                           if r["current_enabled"] and not r["has_preference"]],
+        }

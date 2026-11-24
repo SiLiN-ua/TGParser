@@ -12,10 +12,19 @@ GUARDED = ("messages", "message_versions", "message_media", "message_reactions",
            "user_observations")
 
 
-def test_draft_is_not_in_auto_migrations_dir():
+def test_migration_0011_is_final_and_contiguous():
+    """Migration 0011 lives under migrations/ as a regular numbered file,
+    no stale draft copy is left in design/, and the sequence is contiguous
+    1..11."""
+    import re
     from pathlib import Path
     assert DRAFT.exists()
-    assert not list(Path("migrations").glob("0011*"))
+    assert DRAFT == Path("migrations/0011_dynamic_targets.sql")
+    assert not list(Path("design").glob("0011_dynamic_targets*.sql"))
+    assert not list(Path("migrations").glob("*.draft.sql"))
+    nums = sorted(int(re.match(r"(\d+)_", f.name).group(1))
+                  for f in Path("migrations").glob("*.sql"))
+    assert nums == list(range(1, 12)), nums
 
 
 @pytest.mark.asyncio

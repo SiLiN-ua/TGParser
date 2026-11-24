@@ -466,7 +466,10 @@ async def test_mass_gone_blocked_until_exact_confirmation(harness):
     async with s.pool.acquire() as con:
         await con.execute("UPDATE discovered_dialogs SET gone_at=NOW() WHERE chat_id = ANY($1)", ids[:3])
     await add_pref(s, ch(1), selected=False)                 # any bump triggers reconcile
-    await harness.wait_reconciled_state("mass_gone_blocked")
+    # Reconcile is driven by NOTIFY + polling; 10 s is comfortably above the
+    # ~70 ms end-to-end round of listener + reconcile under combined-group
+    # load.
+    await harness.wait_reconciled_state("mass_gone_blocked", timeout=10)
     assert e.active_ids() == set(ids) and await _enabled(s) == set(ids)
     ps = await s.get_policy_state()
     assert ps["applied_version"] < ps["requested_version"]
@@ -481,7 +484,7 @@ async def test_mass_gone_blocked_until_exact_confirmation(harness):
                 "confirmed_at=NOW(), confirmed_by='admin_cli'", ver, fp)
             await con.execute(
                 "INSERT INTO target_preferences (chat_id, selected) VALUES ($1, FALSE)", ch(2))
-    await harness.wait_reconciled_state("mass_gone_blocked")
+    await harness.wait_reconciled_state("mass_gone_blocked", timeout=10)
     assert (await s.get_policy_state())["blocked_version"] == ver + 1
     assert await _enabled(s) == set(ids)
 

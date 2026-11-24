@@ -32,7 +32,9 @@ async def storage():
         sys_c = await asyncpg.connect(DSN)
         try:
             await sys_c.execute(
-                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{tmp_db}'")
+                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                f"WHERE datname='{tmp_db}' AND usename=current_user "
+                f"AND pid<>pg_backend_pid() AND backend_type='client backend'")
             await sys_c.execute(f"DROP DATABASE IF EXISTS {tmp_db}")
         finally:
             await sys_c.close()
@@ -175,7 +177,8 @@ async def test_db_reconnect_after_terminated_backends(storage):
         dbname = dsn.rsplit("/", 1)[-1]
         await sys_c.execute(
             f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            f"WHERE datname='{dbname}' AND pid <> pg_backend_pid()")
+            f"WHERE datname='{dbname}' AND usename=current_user "
+            f"AND pid<>pg_backend_pid() AND backend_type='client backend'")
     finally:
         await sys_c.close()
     # Pool connections are now dead; retry should re-open transparently.

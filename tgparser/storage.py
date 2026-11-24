@@ -1518,9 +1518,8 @@ class Storage:
                         chat_id, message_id, _j(raw))
 
     # ========================================================================
-    # v11 (draft): dynamic targets foundation. Every method here requires
-    # schema_version() >= 11; callers check that first. The dynamic engine
-    # itself is not wired up yet.
+    # v11: dynamic targets foundation. Every method here requires
+    # schema_version() >= 11; callers check that first.
     # ========================================================================
 
     @_with_db_retry()
@@ -2138,7 +2137,7 @@ class Storage:
         }
 
     # ========================================================================
-    # v11 (draft): dynamic engine runtime primitives
+    # v11: dynamic engine runtime primitives
     # ========================================================================
 
     @_with_db_retry()

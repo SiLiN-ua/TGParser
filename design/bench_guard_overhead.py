@@ -31,7 +31,7 @@ from tgparser.config import load  # noqa: E402
 from tgparser.migrations import apply as apply_migrations  # noqa: E402
 from tgparser.storage import Storage  # noqa: E402
 
-DRAFT = Path(__file__).with_name("0011_dynamic_targets.draft.sql")
+DRAFT = Path(__file__).resolve().parents[1] / "migrations" / "0011_dynamic_targets.sql"
 CHAT = -1009999
 
 

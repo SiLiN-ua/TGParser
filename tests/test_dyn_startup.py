@@ -108,6 +108,20 @@ async def test_v11_recovers_stale_discovery_run(storage_v11, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pre_v11_startup_is_plain_legacy(storage_v10, monkeypatch, caplog):
+    """Exercises the schema<11 branch of _select_engine. We freeze schema at
+    v10 by replacing apply_migrations with a v10-only applier, so the test
+    sees run.py behave as it would on a DB that has not yet been upgraded."""
+    from tests._dyn_support import apply_up_to
+
+    async def apply_up_to_10(pool, migrations_dir="migrations"):
+        s_ = Storage(s.dsn)
+        s_.pool = pool
+        try:
+            await apply_up_to(s_, 10)
+        finally:
+            s_.pool = None
+    monkeypatch.setattr(run, "apply_migrations", apply_up_to_10)
+
     s = storage_v10
     seen = {}
     _install_fake_client(monkeypatch, s.dsn, seen)

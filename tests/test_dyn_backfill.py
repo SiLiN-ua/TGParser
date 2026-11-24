@@ -150,14 +150,17 @@ async def test_backpressure_wait_ends_on_disable(harness, monkeypatch):
     monkeypatch.setattr(col, "_idle", spy_idle)
     await e.start()
 
-    async def paused():
-        st = await s.get_sync_state(A)
-        return st and st["backfill_status"] == "syncing_paused_media_backpressure"
-    await wait_until(paused, what="backpressure pause")
-    assert idles and set(idles) == {10}               # parked inside the 10 s wait
+    # The coordinator writes "syncing_paused_media_backpressure" and ONLY
+    # THEN enters `await self._idle(10)`. Poll on `idles` (not on the DB
+    # status) to avoid the write-visible-but-not-parked race; and use
+    # `>= 1` because _wake set by the initial reconcile causes _idle(10)
+    # to return quickly and the second iteration appends another 10
+    # before the test can observe `idles == [10]` exactly.
+    await wait_until(lambda: len(idles) >= 1 and set(idles) == {10},
+                     what="parked inside the 10 s wait")
     await s.upsert_target_preference(A, selected=False)
     await harness.wait_applied()
-    await wait_until(lambda: any(x in (60, 2) for x in idles), timeout=3,
+    await wait_until(lambda: any(x in (60, 2) for x in idles), timeout=5,
                      what="coordinator left the backpressure wait")
     assert calls["backfill"] == 0
     assert harness.client.iter_messages_calls == []

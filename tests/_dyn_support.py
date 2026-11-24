@@ -1,14 +1,16 @@
-"""Shared fixtures/helpers for the v11 (draft) dynamic-targets tests.
+"""Shared fixtures/helpers for the v11 dynamic-targets tests.
 
-The draft lives in design/ on purpose (run.py must not auto-apply it). These
-fixtures build temporary databases only:
-  storage_v10 - migrations/0001..0010 (whatever migrations/ contains)
-  storage_v11 - the same, then the draft applied explicitly as version 11
+Migration 0011 lives in migrations/ as a normal numbered migration, so
+`apply_migrations` picks it up automatically. These fixtures build temporary
+databases only:
+  storage_v10 - applies ONLY migrations/0001..0010 (for upgrade/seed tests)
+  storage_v11 - applies the full sequence through 0011
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -19,7 +21,9 @@ from tgparser.migrations import apply as apply_migrations
 from tgparser.storage import Storage
 from tests.conftest import BASE_DSN, _admin_dsn, _safe_drop
 
-DRAFT = Path("design/0011_dynamic_targets.draft.sql")
+MIG_0011 = Path("migrations/0011_dynamic_targets.sql")
+# Kept as a backward-compatible alias for tests that import DRAFT.
+DRAFT = MIG_0011
 
 SNAPSHOT_TABLES = (
     "runtime_state", "policy_state", "policy_block_history", "discovery_control",
@@ -30,7 +34,7 @@ SNAPSHOT_TABLES = (
 )
 
 
-async def make_db() -> tuple[Storage, str]:
+async def _create_blank_db() -> tuple[Storage, str]:
     name = f"tgparser_test_{secrets.token_hex(6)}_{os.getpid()}"
     admin = await asyncpg.connect(_admin_dsn())
     try:
@@ -39,12 +43,56 @@ async def make_db() -> tuple[Storage, str]:
         await admin.close()
     s = Storage(BASE_DSN.rsplit("/", 1)[0] + "/" + name)
     await s.connect()
+    return s, name
+
+
+async def make_db() -> tuple[Storage, str]:
+    """Temporary DB with the full migration sequence applied (currently
+    through v11)."""
+    s, name = await _create_blank_db()
     await apply_migrations(s.pool, "migrations")
     return s, name
 
 
-async def apply_draft(storage: Storage, register: bool = True):
-    sql = DRAFT.read_text(encoding="utf-8")
+MIG_RX = re.compile(r"^(\d+)_.*\.sql$")
+
+
+async def apply_up_to(storage: Storage, max_version: int):
+    """Apply every migration whose version is <= max_version, skipping any
+    already registered. The migration file list comes from the real
+    migrations/ directory — no per-version duplication of file paths here."""
+    files = sorted(Path("migrations").glob("*.sql"))
+    async with storage.pool.acquire() as con:
+        await con.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version INT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())")
+        done = {r["version"] for r in
+                await con.fetch("SELECT version FROM schema_migrations")}
+        for f in files:
+            m = MIG_RX.match(f.name)
+            if not m:
+                continue
+            ver = int(m.group(1))
+            if ver > max_version or ver in done:
+                continue
+            async with con.transaction():
+                await con.execute(f.read_text(encoding="utf-8"))
+                await con.execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1)", ver)
+
+
+async def make_db_v10() -> tuple[Storage, str]:
+    """Temporary DB with ONLY migrations 0001..0010 applied, for v10 shape /
+    upgrade tests."""
+    s, name = await _create_blank_db()
+    await apply_up_to(s, 10)
+    return s, name
+
+
+async def apply_migration_11(storage: Storage, register: bool = True):
+    """Apply migrations/0011_dynamic_targets.sql explicitly to a v10 DB
+    and record it in schema_migrations. For the upgrade/seed tests."""
+    sql = MIG_0011.read_text(encoding="utf-8")
     async with storage.pool.acquire() as con:
         async with con.transaction():
             await con.execute(sql)
@@ -52,6 +100,10 @@ async def apply_draft(storage: Storage, register: bool = True):
                 await con.execute(
                     "INSERT INTO schema_migrations (version) VALUES (11) "
                     "ON CONFLICT DO NOTHING")
+
+
+# Backward-compatible alias.
+apply_draft = apply_migration_11
 
 
 async def _dispose(s: Storage, name: str):
@@ -64,7 +116,7 @@ async def _dispose(s: Storage, name: str):
 
 @pytest_asyncio.fixture
 async def storage_v10():
-    s, name = await make_db()
+    s, name = await make_db_v10()
     try:
         yield s
     finally:

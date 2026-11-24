@@ -1,9 +1,8 @@
--- DRAFT of migration 11: dynamic targets foundation (additive, gate off).
+-- Version 11: dynamic targets foundation (additive, gate off).
 --
--- THIS FILE MUST NOT LIVE IN migrations/ UNTIL FINAL APPROVAL. run.py
--- auto-applies everything in migrations/ at startup.
---
--- Tests apply it explicitly as version 11 on temporary databases only.
+-- Promoted from design/0011_dynamic_targets.draft.sql (no logic change) after
+-- stage-2 rehearsal of upgrade, rollback and gate-off compatibility on
+-- temporary databases.
 --
 -- Contract:
 --   * Fully re-runnable: a second execution changes no rows, no timestamps,

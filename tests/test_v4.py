@@ -42,7 +42,8 @@ async def storage():
         try:
             await sys_c.execute(
                 f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                f"WHERE datname='{tmp}'")
+                f"WHERE datname='{tmp}' AND usename=current_user "
+                f"AND pid<>pg_backend_pid() AND backend_type='client backend'")
             await sys_c.execute(f"DROP DATABASE IF EXISTS {tmp}")
         finally:
             await sys_c.close()

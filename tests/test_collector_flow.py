@@ -253,6 +253,149 @@ async def test_bg_tasks_awaited_on_shutdown(storage, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_spawn_bg_cancelled_at_sema_closes_coro(storage, tmp_path):
+    """Wrapper is cancelled while parked at _bg_sema (never reaches `await coro`).
+    The passed-in coroutine must be closed, no 'never awaited' warning leaks."""
+    import warnings as _warnings
+    client = FakeClient({})
+    coll, _ = _build_collector(storage, client, tmp_path,
+                               options={"bg_concurrency": 1})
+    # Occupy the sole semaphore slot with a hog that never finishes until we
+    # cancel it. The pending-at-sema wrapper is the test target.
+    release = asyncio.Event()
+    async def _hog():
+        await release.wait()
+    hog_coro = _hog()
+    hog_task = coll._spawn_bg(hog_coro, name="hog")
+    # Give the loop a tick so `_hog`'s _runner gets the sema.
+    await asyncio.sleep(0)
+
+    started_marker = {"n": 0}
+    async def _victim():
+        started_marker["n"] += 1   # must NEVER run
+        await asyncio.sleep(0)
+    victim_coro = _victim()
+
+    with _warnings.catch_warnings(record=True) as w:
+        _warnings.simplefilter("always")
+        victim_task = coll._spawn_bg(victim_coro, name="victim")
+        await asyncio.sleep(0)     # let create_task/_runner schedule
+        # Cancel the victim while it is waiting for the sema.
+        victim_task.cancel()
+        try:
+            await victim_task
+        except asyncio.CancelledError:
+            pass
+        # Drain to let close callbacks run.
+        await asyncio.sleep(0)
+        # Release the hog cleanly to avoid interference with later teardown.
+        release.set()
+        await coll.wait_background(timeout=2)
+        never_awaited = [x for x in w
+                         if issubclass(x.category, RuntimeWarning)
+                         and "never awaited" in str(x.message)]
+    assert started_marker["n"] == 0, "victim coroutine must not have started"
+    assert never_awaited == [], f"unexpected RuntimeWarnings: {never_awaited}"
+    # Coroutine object has no frame once closed.
+    assert victim_coro.cr_frame is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_bg_cancelled_mid_run_no_warning(storage, tmp_path):
+    """Wrapper is cancelled AFTER it already entered `await coro`. CancelledError
+    propagates normally; no 'never awaited' RuntimeWarning fires."""
+    import warnings as _warnings
+    client = FakeClient({})
+    coll, _ = _build_collector(storage, client, tmp_path)
+    entered = asyncio.Event()
+    async def _slow():
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+    slow_coro = _slow()
+    with _warnings.catch_warnings(record=True) as w:
+        _warnings.simplefilter("always")
+        t = coll._spawn_bg(slow_coro, name="slow")
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        never_awaited = [x for x in w
+                         if issubclass(x.category, RuntimeWarning)
+                         and "never awaited" in str(x.message)]
+    assert never_awaited == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_bg_create_task_failure_closes_coro(storage, tmp_path,
+                                                        monkeypatch):
+    """If asyncio.create_task() raises, the input coroutine must be closed to
+    prevent 'never awaited'. The exception must propagate."""
+    import warnings as _warnings
+    client = FakeClient({})
+    coll, _ = _build_collector(storage, client, tmp_path)
+    async def _victim():
+        await asyncio.sleep(0)
+    victim_coro = _victim()
+    class _Boom(RuntimeError): pass
+    def _fail_create_task(*a, **kw):
+        raise _Boom("synthetic task-creation failure")
+    monkeypatch.setattr(asyncio, "create_task", _fail_create_task)
+    with _warnings.catch_warnings(record=True) as w:
+        _warnings.simplefilter("always")
+        with pytest.raises(_Boom):
+            coll._spawn_bg(victim_coro, name="victim")
+        await asyncio.sleep(0)
+        never_awaited = [x for x in w
+                         if issubclass(x.category, RuntimeWarning)
+                         and "never awaited" in str(x.message)]
+    assert never_awaited == []
+    assert victim_coro.cr_frame is None
+
+
+@pytest.mark.asyncio
+async def test_wait_background_bounded_shutdown_with_hung_bg_tasks(storage, tmp_path):
+    """Regression guard: adding close-on-cancel must not break the bounded
+    shutdown contract. wait_background returns within timeout, hung tasks are
+    cancelled, no RuntimeWarning fires."""
+    import time, warnings as _warnings
+    client = FakeClient({})
+    coll, _ = _build_collector(storage, client, tmp_path,
+                               options={"bg_concurrency": 1})
+    async def _never(evt):
+        try:
+            await evt.wait()
+        except asyncio.CancelledError:
+            raise
+    evt = asyncio.Event()
+    # First one acquires the sema and parks inside `await coro`.
+    # Second one parks at the sema (started=False).
+    coro1 = _never(evt)
+    coro2 = _never(evt)
+    with _warnings.catch_warnings(record=True) as w:
+        _warnings.simplefilter("always")
+        coll._spawn_bg(coro1, name="never1")
+        await asyncio.sleep(0)
+        coll._spawn_bg(coro2, name="never2")
+        await asyncio.sleep(0)
+        t0 = time.monotonic()
+        await coll.wait_background(timeout=0.3)
+        dt = time.monotonic() - t0
+        await asyncio.sleep(0)
+        never_awaited = [x for x in w
+                         if issubclass(x.category, RuntimeWarning)
+                         and "never awaited" in str(x.message)]
+    assert dt < 2.0, f"wait_background took {dt:.2f}s; expected bounded"
+    assert never_awaited == [], f"warnings leaked: {never_awaited}"
+    assert coll._bg_tasks == set() or all(t.done() for t in coll._bg_tasks)
+
+
+@pytest.mark.asyncio
 async def test_avatar_refresh_on_photo_id_change(storage, tmp_path):
     """§6: avatar_history gets a new row when photo_file_id changes."""
     cid = -1001

@@ -351,6 +351,53 @@ async def test_chat_sourced_bg_task_cancelled_on_disable(harness):
     assert await _enabled(s, A) is False
 
 
+@pytest.mark.asyncio
+async def test_dynamic_stop_with_pending_bg_enrichment_no_warning(harness):
+    """Dynamic shutdown with user-enrichment coroutines parked at _bg_sema:
+    engine.stop() + collector.wait_background() (the production teardown
+    pair from run.py) cancels them cleanly — no 'never awaited'
+    RuntimeWarning, no Traceback, victim coros are closed."""
+    import warnings as _warnings
+    s = harness.storage
+    await add_dialog(s, A); await add_pref(s, A, selected=True)
+    e = await harness.start()
+    coll = harness.collector
+    # Replace _bg_sema with a tiny one to force parking deterministically.
+    coll._bg_sema = asyncio.Semaphore(1)
+    hog_release = asyncio.Event()
+    async def _hog():
+        await hog_release.wait()
+    hog_coro = _hog()
+    coll._spawn_bg(hog_coro, name="hog")
+    await asyncio.sleep(0)   # hog acquires the sema
+
+    victim_coros = []
+    async def _victim():
+        await asyncio.sleep(0.01)   # must NOT run
+    for i in range(3):
+        c = _victim()
+        victim_coros.append(c)
+        coll._spawn_bg(c, name=f"user:{i}", chat_id=A)
+    await asyncio.sleep(0)
+
+    with _warnings.catch_warnings(record=True) as w:
+        _warnings.simplefilter("always")
+        # Production teardown order: engine.stop() first, then
+        # collector.wait_background() (run.py §3–§5).
+        await e.stop()
+        # Release hog so its wrapper can also finish during drain.
+        hog_release.set()
+        await coll.wait_background(timeout=2)
+        # Let add_done_callback run once more.
+        await asyncio.sleep(0)
+        never_awaited = [x for x in w
+                         if issubclass(x.category, RuntimeWarning)
+                         and "never awaited" in str(x.message)]
+    assert never_awaited == [], f"warnings leaked: {never_awaited}"
+    for c in victim_coros:
+        assert c.cr_frame is None, "victim coroutine left un-closed"
+
+
 # -----------------------------------------------------------------------
 # 6. Media cases
 # -----------------------------------------------------------------------

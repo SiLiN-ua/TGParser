@@ -1707,8 +1707,18 @@ class Collector:
 
     # -- background tasks ----------------------------------------------------
     def _spawn_bg(self, coro, name: str, chat_id: int | None = None):
+        # `started` flips to True only after `self._bg_sema` is acquired, i.e.
+        # the instant before `await coro` is reached. If the wrapper finishes
+        # with started=False, `coro` was never handed to an awaiter — we close
+        # it so Python does not GC-warn "coroutine was never awaited" (seen
+        # during shutdown when wait_background cancels wrappers parked at the
+        # semaphore).
+        started = False
+
         async def _runner():
+            nonlocal started
             async with self._bg_sema:
+                started = True
                 try:
                     await coro
                 except asyncio.CancelledError:
@@ -1723,9 +1733,30 @@ class Collector:
                         await self.storage.record_error("bg_" + name, chat_id, None, None, e)
                     except Exception:
                         pass
-        t = asyncio.create_task(_runner(), name=name)
+        runner_coro = _runner()
+        try:
+            t = asyncio.create_task(runner_coro, name=name)
+        except BaseException:
+            # Task creation failed (no running loop, loop closed, etc.).
+            # Neither `runner_coro` nor `coro` ever got an awaiter; close
+            # both so Python does not GC-warn either of them.
+            for c in (runner_coro, coro):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            raise
+
+        def _on_done(task: asyncio.Task):
+            self._bg_tasks.discard(task)
+            if not started:
+                try:
+                    coro.close()
+                except Exception:
+                    pass
+
         self._bg_tasks.add(t)
-        t.add_done_callback(self._bg_tasks.discard)
+        t.add_done_callback(_on_done)
         if chat_id is not None and self._bg_spawn_hook is not None:
             self._bg_spawn_hook(chat_id, t)
         return t

@@ -13,6 +13,7 @@ from tgparser.storage import Storage
 from tgparser.migrations import apply as apply_migrations
 from tgparser.media_queue import MediaQueue
 from tgparser.collector import Collector
+from tgparser.dynamic import DynamicEngine
 from tgparser.qr_login import qr_login
 
 
@@ -91,22 +92,25 @@ async def _db_heartbeat_loop(storage, stop: asyncio.Event, interval: int = 15):
             pass
 
 
-async def _init_v11_legacy(storage, log: logging.Logger) -> None:
-    """Runs before any Telegram connect or collector write.
+async def _select_engine(storage, log: logging.Logger) -> str:
+    """Runs before any Telegram connect or collector write; returns 'legacy'
+    or 'dynamic'. The choice holds for the whole process lifetime.
 
-    With schema v11 this legacy process must record dyn_engine=FALSE, so a
-    stale TRUE from a previous dynamic process cannot leave the guard armed
-    against legacy writes (or, worse, pretend a dynamic engine is running).
-    Failure is fatal. Below v11 there is nothing to initialise."""
+      schema < 11              -> legacy, nothing v11-related is touched
+      schema >= 11, gate off   -> legacy
+      schema >= 11, gate on    -> dynamic
+
+    With schema v11 dyn_engine=FALSE is recorded first in BOTH cases, so a
+    stale TRUE from a previous dynamic process never survives this start; the
+    dynamic engine sets TRUE itself only once it is fully ready. Failure to
+    record FALSE is fatal."""
     try:
         version = await storage.schema_version()
     except Exception as e:
         raise StartupError(f"schema version unavailable: {type(e).__name__}")
     if version < 11:
-        return
-    if await storage.dynamic_gate_enabled():
-        log.warning("deployment gate 'dynamic_targets' is on, but this build "
-                    "runs only the legacy engine")
+        return "legacy"
+    engine = "dynamic" if await storage.dynamic_gate_enabled() else "legacy"
     try:
         await storage.set_runtime_dynamic_engine(False)
     except Exception as e:
@@ -118,6 +122,8 @@ async def _init_v11_legacy(storage, log: logging.Logger) -> None:
             log.warning("marked %s stale discovery run(s) failed", n)
     except Exception as e:
         log.warning("stale discovery recovery skipped: %s", type(e).__name__)
+    log.info("engine selected: %s (schema v%s)", engine, version)
+    return engine
 
 
 async def _main_inner(log: logging.Logger, cfg: dict,
@@ -126,6 +132,7 @@ async def _main_inner(log: logging.Logger, cfg: dict,
     client = None
     media_q = None
     collector = None
+    engine = None
     heartbeat_task: asyncio.Task | None = None
     tg_heartbeat_task: asyncio.Task | None = None
     try:
@@ -136,7 +143,7 @@ async def _main_inner(log: logging.Logger, cfg: dict,
             raise StartupError("postgres unavailable")
         await apply_migrations(storage.pool, "migrations")
 
-        await _init_v11_legacy(storage, log)
+        engine_kind = await _select_engine(storage, log)
 
         client = make_client(cfg)
         try:
@@ -161,6 +168,37 @@ async def _main_inner(log: logging.Logger, cfg: dict,
         collector = Collector(client, storage, media_q, opts)
 
         requested = list(cfg.get("targets") or [])
+
+        if engine_kind == "dynamic":
+            # Same client, storage, collector and media queue; collector.start
+            # (legacy `chats=` handlers + YAML-driven disable) is never called.
+            engine = DynamicEngine(client, storage, collector, media_q,
+                                   yaml_targets=requested, options=opts)
+            try:
+                await engine.start()
+            except Exception as e:
+                log.error("dynamic engine startup failed: %s", e)
+                raise StartupError("dynamic engine startup failed")
+            await storage.set_runtime(os.getpid(), "healthy",
+                                      sorted(engine.active_ids()),
+                                      note="engine=dynamic", started=True)
+            heartbeat_task = asyncio.create_task(
+                _db_heartbeat_loop(storage, stop, interval=15), name="db-hb")
+            tg_heartbeat_task = asyncio.create_task(
+                _tg_heartbeat_loop(client, storage, stop, interval=30), name="tg-hb")
+            try:
+                swept = await media_q.sweep_retryable()
+                if swept:
+                    log.info("media sweep re-enqueued %s files", swept)
+            except Exception as e:
+                log.warning("media sweep failed: %s", e)
+            await collector.catch_up()
+            await storage.set_runtime(os.getpid(), "syncing",
+                                      sorted(engine.active_ids()), note="engine=dynamic")
+            log.info("running (dynamic engine); live updates on. Ctrl+C to stop.")
+            await stop.wait()
+            return EXIT_OK
+
         resolved = await collector.start(requested)
 
         if resolved == 0:
@@ -223,7 +261,10 @@ async def _main_inner(log: logging.Logger, cfg: dict,
             #    final write leaves the row at 'stopping' with a dead pid,
             #    which health.py correctly flags as unhealthy.
             try:
-                _targets = list(collector.ok_targets) if collector else []
+                if engine:
+                    _targets = sorted(engine.active_ids())
+                else:
+                    _targets = list(collector.ok_targets) if collector else []
                 await storage.set_runtime(os.getpid(), "stopping",
                                           _targets, note=None)
             except BaseException:
@@ -238,6 +279,15 @@ async def _main_inner(log: logging.Logger, cfg: dict,
                         await t
                     except BaseException:
                         pass
+
+            # 2b) Dynamic engine: stop discovery/reconciler/listener/YAML
+            #     tasks before the coordinator and the client they use.
+            if engine:
+                try:
+                    await engine.stop()
+                except BaseException:
+                    log.exception("dynamic engine stop failed")
+                log.info("dynamic engine stopped")
 
             # 3) Coordinator (~5s budget). Batches advance checkpoint only
             #    after a successful commit, so cancelling mid-batch leaves
@@ -279,6 +329,13 @@ async def _main_inner(log: logging.Logger, cfg: dict,
                     log.exception("client disconnect failed")
                 if disconnected:
                     log.info("client disconnected")
+
+            # 6a) Dynamic engine is no longer running: every writer is down.
+            if engine:
+                try:
+                    await storage.set_runtime_dynamic_engine(False)
+                except BaseException:
+                    log.exception("could not reset dyn_engine on shutdown")
 
             # 6) Final 'stopped' + pid=NULL.
             try:

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -10,6 +11,7 @@ from telethon.tl.types import (
 )
 from telethon import errors
 
+from .collector import _TargetInactive as _TargetInactiveLocal
 from .retry import retry_async
 
 log = logging.getLogger("tgparser.media")
@@ -116,6 +118,22 @@ class MediaQueue:
         self._accepting = True
         self._inflight: set[str] = set()         # file_ids currently queued or downloading
         self._inflight_lock = asyncio.Lock()
+        # Dynamic engine: callable() -> frozenset of active chat ids. None =>
+        # legacy behaviour (every chat).
+        self.active_ids = None
+        # Dynamic engine: async contextmanager factory `lease(chat_id)`. Held
+        # across enqueue DB writes and across the worker's download+finalize
+        # so a disable barrier cannot land between a finished file and its
+        # message link. None => legacy behaviour (null context).
+        self.chat_lease = None
+
+    def _chat_active(self, chat_id) -> bool:
+        return self.active_ids is None or chat_id in self.active_ids()
+
+    def _lease_ctx(self, chat_id):
+        if self.chat_lease is None:
+            return contextlib.nullcontext()
+        return self.chat_lease(chat_id)
 
     def start(self):
         for i in range(self.concurrency):
@@ -206,6 +224,18 @@ class MediaQueue:
     async def enqueue(self, chat_id: int, message):
         if not self._accepting:
             return None
+        # Dynamic engine: reject if the chat has already left the active set.
+        # The lease is then held across every DB write below so a disable
+        # barrier cannot land between upsert_media_record and link_message_media.
+        if not self._chat_active(chat_id):
+            return None
+        try:
+            async with self._lease_ctx(chat_id):
+                return await self._enqueue_locked(chat_id, message)
+        except _TargetInactiveLocal:
+            return None
+
+    async def _enqueue_locked(self, chat_id: int, message):
         desc = media_descriptor(message)
         if desc is None:
             return None
@@ -275,6 +305,17 @@ class MediaQueue:
         """Enqueue a retry for a file we already know about but need to fetch again."""
         if not self._accepting:
             return
+        if not self._chat_active(chat_id):
+            return
+        try:
+            async with self._lease_ctx(chat_id):
+                await self._enqueue_by_ref_locked(
+                    chat_id, message_id, file_id, media_type, size)
+        except _TargetInactiveLocal:
+            return
+
+    async def _enqueue_by_ref_locked(self, chat_id, message_id, file_id,
+                                     media_type, size):
         if not await self._mark_inflight(file_id):
             return
         # We need the real message object to call download_media; fetch on demand.
@@ -308,7 +349,11 @@ class MediaQueue:
         larger backlog — accumulated across process crashes while items were
         in the in-memory asyncio.Queue — starve workers and deadlock).
         """
-        rows = await self.storage.media_get_retryable(limit=limit)
+        if self.active_ids is not None:
+            rows = await self.storage.media_get_retryable(
+                limit=limit, chat_ids=list(self.active_ids()))
+        else:
+            rows = await self.storage.media_get_retryable(limit=limit)
         for r in rows:
             await self.enqueue_by_ref(r["chat_id"], r["message_id"],
                                       r["file_id"], r["media_type"], r["size"])
@@ -327,6 +372,31 @@ class MediaQueue:
                 self.queue.task_done()
                 return
             file_id = item["desc"]["file_id"]
+            chat_id = item.get("chat_id")
+            if not self._chat_active(chat_id):
+                # Target left the active set between enqueue and dequeue:
+                # leave the media row pending in Postgres (swept again if
+                # the target is re-enabled).
+                await self._release_inflight(file_id)
+                self.queue.task_done()
+                continue
+            # Dynamic engine: hold the per-chat lease for the WHOLE download
+            # + final writes. A disable barrier cannot land between a finished
+            # file and its message link; if the chat left the set between the
+            # _chat_active check and lease acquisition, _TargetInactiveLocal
+            # drops the item back to pending in the DB.
+            try:
+                _lease = self._lease_ctx(chat_id)
+                try:
+                    await _lease.__aenter__()
+                except _TargetInactiveLocal:
+                    await self._release_inflight(file_id)
+                    self.queue.task_done()
+                    continue
+            except Exception:
+                await self._release_inflight(file_id)
+                self.queue.task_done()
+                continue
             try:
                 await self.storage.worker_heartbeat(
                     idx, pid=pid, current_file_id=file_id)
@@ -368,6 +438,11 @@ class MediaQueue:
                     pass
                 raise
             except Exception as e:
+                if getattr(e, "sqlstate", None) == "TGP01":
+                    # Disabled mid-download (dynamic engine): the media row
+                    # keeps whatever state it reached; not a failure.
+                    log.info("media %s: target disabled during download", file_id)
+                    continue
                 # v6: classify expired file reference as 'needs_refresh' so the
                 # coordinator refreshes the Message object instead of looping.
                 err_s = str(e)
@@ -409,6 +484,10 @@ class MediaQueue:
                 try:
                     stop_hb.set()
                     await hb_task
+                except Exception:
+                    pass
+                try:
+                    await _lease.__aexit__(None, None, None)
                 except Exception:
                     pass
                 await self._release_inflight(file_id)

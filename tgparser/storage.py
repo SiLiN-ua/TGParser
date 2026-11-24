@@ -599,7 +599,8 @@ class Storage:
             return row["status"], row["local_path"]
 
     @_with_db_retry()
-    async def media_get_retryable(self, limit: int = 200) -> list[asyncpg.Record]:
+    async def media_get_retryable(self, limit: int = 200,
+                                  chat_ids: list[int] | None = None) -> list[asyncpg.Record]:
         async with self.pool.acquire() as con:
             return await con.fetch("""
                 SELECT m.file_id, m.chat_id, m.message_id, m.media_type, m.size, m.attempts
@@ -607,9 +608,10 @@ class Storage:
                 WHERE m.status IN ('pending','failed')
                   AND m.attempts < 5
                   AND m.chat_id IS NOT NULL AND m.message_id IS NOT NULL
+                  AND ($2::bigint[] IS NULL OR m.chat_id = ANY($2::bigint[]))
                 ORDER BY m.first_seen ASC
                 LIMIT $1
-            """, limit)
+            """, limit, chat_ids)
 
     @_with_db_retry()
     async def link_message_media(self, chat_id: int, message_id: int, file_id: str):
@@ -1405,13 +1407,15 @@ class Storage:
             return await con.fetchval("SELECT COUNT(*) FROM users WHERE id < 0")
 
     @_with_db_retry()
-    async def media_needs_refresh(self, limit: int = 100) -> list:
+    async def media_needs_refresh(self, limit: int = 100,
+                                  chat_ids: list[int] | None = None) -> list:
         async with self.pool.acquire() as con:
             return [dict(r) for r in await con.fetch(
                 "SELECT file_id, chat_id, message_id, media_type, attempts "
                 "FROM media WHERE status='needs_refresh' "
                 "AND chat_id IS NOT NULL AND message_id IS NOT NULL "
-                "AND attempts < 5 ORDER BY first_seen LIMIT $1", limit)]
+                "AND ($2::bigint[] IS NULL OR chat_id = ANY($2::bigint[])) "
+                "AND attempts < 5 ORDER BY first_seen LIMIT $1", limit, chat_ids)]
 
     # --- v4: telegram heartbeat ---------------------------------------------
     @_with_db_retry()
@@ -2116,6 +2120,12 @@ class Storage:
                 "gone_enabled_count": len(gone_ids),
                 "active_count": active,
             },
+            "reconcile": {
+                "version": ps["reconcile_version"],
+                "state": ps["reconcile_state"],
+                "error": ps["reconcile_error"],
+                "at": ps["reconciled_at"],
+            },
             "disable_suppressed_by": suppressed,
             "would_enable": would_enable,
             "would_disable": would_disable,
@@ -2126,3 +2136,170 @@ class Storage:
             "enabled_without_preference": [r["chat_id"] for r in rows
                                            if r["current_enabled"] and not r["has_preference"]],
         }
+
+    # ========================================================================
+    # v11 (draft): dynamic engine runtime primitives
+    # ========================================================================
+
+    @_with_db_retry()
+    async def policy_snapshot(self) -> dict:
+        """One consistent read (REPEATABLE READ) of requested_version, mode,
+        whether any discovery snapshot is complete, and every policy row."""
+        async with self.pool.acquire() as con:
+            async with con.transaction(isolation="repeatable_read", readonly=True):
+                ps = await con.fetchrow(
+                    "SELECT requested_version, applied_version FROM policy_state WHERE id=1")
+                mode = await con.fetchval("SELECT mode FROM collection_config WHERE id=1")
+                complete = await con.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM dialog_discovery_runs WHERE status='complete')")
+                rows = await con.fetch(
+                    "SELECT chat_id, desired, reason, title, username, current_enabled, "
+                    "in_target_state FROM v_target_policy")
+                enabled = [r["chat_id"] for r in await con.fetch(
+                    "SELECT chat_id FROM target_state WHERE enabled=TRUE")]
+        return {"requested_version": int(ps["requested_version"]),
+                "applied_version": int(ps["applied_version"]),
+                "mode": mode, "any_complete_discovery": bool(complete),
+                "rows": [dict(r) for r in rows], "enabled": set(enabled)}
+
+    @_with_db_retry()
+    async def enable_dynamic_target(self, chat_id: int, label: str) -> None:
+        """Step 1 of enabling: target_state enabled=TRUE and a sync_state row.
+        An existing checkpoint, backfill status and label are preserved."""
+        label = (label or str(chat_id))[:200]
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    "INSERT INTO target_state (chat_id, target, backfill_status, enabled, "
+                    "  label, updated_at) VALUES ($1,$2,'running',TRUE,$2,NOW()) "
+                    "ON CONFLICT (chat_id) DO UPDATE SET enabled=TRUE, disabled_at=NULL, "
+                    "  disabled_reason=NULL, updated_at=NOW()",
+                    chat_id, label)
+                await con.execute(
+                    "INSERT INTO sync_state (chat_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                    chat_id)
+                await con.execute(
+                    "INSERT INTO coordinator_progress (chat_id, batch_running, updated_at) "
+                    "VALUES ($1, FALSE, NOW()) ON CONFLICT (chat_id) DO NOTHING", chat_id)
+
+    async def disable_target_ack(self, chat_id: int, reason: str,
+                                 lock_timeout_ms: int = 30_000) -> None:
+        """Disable ACK. Takes the EXCLUSIVE advisory xact lock on chat_id (the
+        key the write guard takes SHARED), so it waits for guarded writes that
+        already started; then enabled=FALSE. COMMIT is the ACK: from then on
+        the guard rejects every write for this chat (dynamic engine).
+        Not retried automatically: the reconciler retries the whole step."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(f"SET LOCAL lock_timeout = {int(lock_timeout_ms)}")
+                await con.execute("SELECT pg_advisory_xact_lock($1::bigint)", chat_id)
+                await con.execute(
+                    "UPDATE target_state SET enabled=FALSE, disabled_at=NOW(), "
+                    "  disabled_reason=$2, updated_at=NOW() WHERE chat_id=$1",
+                    chat_id, (reason or "policy")[:120])
+
+    @_with_db_retry()
+    async def set_backfill_checkpoint_if_enabled(self, chat_id: int, last_id: int,
+                                                 first_id: int | None = None) -> bool:
+        """Dynamic engine checkpoint: same GREATEST semantics as
+        set_backfill_checkpoint, but under the shared advisory lock and only
+        while target_state.enabled is TRUE, so a disabled target's checkpoint
+        cannot move after its disable ACK."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute("SELECT pg_advisory_xact_lock_shared($1::bigint)", chat_id)
+                res = await con.execute(
+                    "UPDATE sync_state SET "
+                    "  last_backfilled_message_id = GREATEST(last_backfilled_message_id, $2), "
+                    "  first_message_id = COALESCE(LEAST(first_message_id, $3), "
+                    "                              first_message_id, $3), "
+                    "  updated_at = NOW() "
+                    "WHERE chat_id=$1 AND EXISTS (SELECT 1 FROM target_state t "
+                    "  WHERE t.chat_id=$1 AND t.enabled IS TRUE)",
+                    chat_id, last_id, first_id)
+                return res.endswith(" 1")
+
+    @_with_db_retry()
+    async def record_reconcile(self, version: int, state: str, error: str | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE policy_state SET reconcile_version=$1, reconcile_state=$2, "
+                "  reconcile_error=$3, reconciled_at=NOW() WHERE id=1",
+                int(version), state, (error[:500] if error else None))
+
+    @_with_db_retry()
+    async def media_pending_count_for(self, chat_ids: list[int]) -> int:
+        async with self.pool.acquire() as con:
+            return int(await con.fetchval(
+                "SELECT COUNT(*) FROM media WHERE status='pending' "
+                "AND chat_id = ANY($1::bigint[])", chat_ids))
+
+    @_with_db_retry()
+    async def mark_deleted_existing_unique(self, chat_ids: list[int],
+                                           message_ids: list[int]) -> dict:
+        """Deletion WITHOUT chat id (private / basic-group ids are account
+        wide). Only already stored, non-channel messages of the given active
+        chats are touched; an id matching more than one chat is ambiguous and
+        left alone. No stubs are created. Returns {matched, ambiguous,
+        unknown} id lists."""
+        ids = sorted({int(x) for x in message_ids})
+        cands = [c for c in chat_ids if int(c) > -10**12]   # not a channel
+        if not ids:
+            return {"matched": [], "ambiguous": [], "unknown": []}
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                rows = await con.fetch(
+                    "SELECT message_id, array_agg(chat_id) chats FROM messages "
+                    "WHERE message_id = ANY($1::bigint[]) AND chat_id = ANY($2::bigint[]) "
+                    "GROUP BY message_id", ids, cands)
+                matched, ambiguous = [], []
+                pairs_chat, pairs_msg = [], []
+                for r in rows:
+                    if len(r["chats"]) == 1:
+                        matched.append(r["message_id"])
+                        pairs_chat.append(r["chats"][0])
+                        pairs_msg.append(r["message_id"])
+                    else:
+                        ambiguous.append(r["message_id"])
+                if pairs_msg:
+                    await con.execute(
+                        "UPDATE messages m SET is_deleted=TRUE, "
+                        "  deleted_at=COALESCE(m.deleted_at, NOW()) "
+                        "FROM unnest($1::bigint[], $2::bigint[]) AS p(chat_id, message_id) "
+                        "WHERE m.chat_id=p.chat_id AND m.message_id=p.message_id",
+                        pairs_chat, pairs_msg)
+        seen = set(matched) | set(ambiguous)
+        return {"matched": sorted(matched), "ambiguous": sorted(ambiguous),
+                "unknown": [i for i in ids if i not in seen]}
+
+    # --- YAML import worker -----------------------------------------------------
+    @_with_db_retry()
+    async def yaml_import_due(self, limit: int) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as con:
+            return await con.fetch(
+                "SELECT id, raw_target, status, attempts FROM yaml_target_imports "
+                "WHERE status IN ('pending','retry') "
+                "  AND (next_retry_at IS NULL OR next_retry_at <= NOW()) "
+                "ORDER BY COALESCE(next_retry_at, created_at), id LIMIT $1", int(limit))
+
+    @_with_db_retry()
+    async def yaml_import_resolved(self, raw_target: str, chat_id: int) -> bool:
+        """Resolved: mark the import 'selected' and create a selected
+        preference ONLY if the chat has no preference yet (a later manual
+        choice is never overwritten). Returns True if a preference was
+        created. One transaction, so at most one policy bump."""
+        t = self._yaml_target(raw_target)
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                upd = await con.fetchval(
+                    "UPDATE yaml_target_imports SET status='selected', resolved_chat_id=$2, "
+                    "  resolved_at=NOW(), last_attempt_at=NOW() "
+                    "WHERE raw_target=$1 AND status IN ('pending','retry') RETURNING id",
+                    t, int(chat_id))
+                if upd is None:
+                    return False
+                created = await con.fetchval(
+                    "INSERT INTO target_preferences (chat_id, selected, excluded, updated_by) "
+                    "VALUES ($1, TRUE, FALSE, 'yaml_import') "
+                    "ON CONFLICT (chat_id) DO NOTHING RETURNING chat_id", int(chat_id))
+                return created is not None

@@ -216,7 +216,15 @@ CREATE TABLE IF NOT EXISTS policy_state (
     confirmed_fingerprint TEXT,
     confirmed_at          TIMESTAMPTZ,
     confirmed_by          TEXT,
+    -- last reconcile attempt of the dynamic engine (visible state/error)
+    reconcile_version BIGINT,
+    reconcile_state   TEXT,
+    reconcile_error   TEXT,
+    reconciled_at     TIMESTAMPTZ,
     CONSTRAINT ps_singleton CHECK (id = 1),
+    CONSTRAINT ps_reconcile_state CHECK (reconcile_state IS NULL OR reconcile_state IN
+        ('ok','awaiting_discovery','mass_gone_blocked','error')),
+    CONSTRAINT ps_reconcile_error CHECK (reconcile_error IS NULL OR char_length(reconcile_error) <= 500),
     CONSTRAINT ps_applied_le CHECK (applied_version <= requested_version),
     CONSTRAINT ps_blocked_reason CHECK (blocked_reason IS NULL OR blocked_reason IN ('mass_gone')),
     CONSTRAINT ps_blocked_fp CHECK (blocked_fingerprint IS NULL OR blocked_fingerprint ~ '^[0-9a-f]{64}$'),

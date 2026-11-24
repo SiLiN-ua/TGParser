@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import random
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,15 @@ def _to_dict_safe(entity):
         return entity.to_dict()
     except Exception:
         return {}
+
+
+def is_inactive_write(exc: BaseException) -> bool:
+    """The v11 chat write guard rejected the write (target not enabled)."""
+    return getattr(exc, "sqlstate", None) == "TGP01"
+
+
+class _TargetInactive(Exception):
+    """Raised inside backfill when the target stopped being active."""
 
 
 class Collector:
@@ -95,6 +105,47 @@ class Collector:
         self._stop = asyncio.Event()
         # Per-PID batch counter (acceptance proof: >=2 batches per target same PID)
         self.batches_this_pid: dict[int, int] = {}
+        # Dynamic engine hooks. None => legacy behaviour, unchanged.
+        self._active_check = None          # callable(chat_id) -> bool
+        self._dynamic = False
+        # Async context-manager factory for per-chat work; dynamic engine
+        # supplies its lease(chat_id) here. Legacy stays on nullcontext.
+        self._chat_work_ctx = None
+        # Hook called after a chat-attributed bg task is spawned; dynamic
+        # engine registers the task in its per-chat lease registry so a
+        # disable can cancel chat-sourced user/profile/reaction follow-ups.
+        self._bg_spawn_hook = None         # callable(chat_id, task) -> None
+        self._wake = asyncio.Event()       # set when the target set changes
+
+    def _is_active(self, chat_id: int) -> bool:
+        return self._active_check is None or bool(self._active_check(chat_id))
+
+    def _begin_chat_work(self, chat_id: int):
+        """Enter the per-chat work context. Legacy is a null context; the
+        dynamic engine returns its per-chat lease, whose __aenter__ raises
+        _TargetInactive if the chat is no longer active, and which blocks
+        a disable-ACK quiesce from completing while held."""
+        if self._chat_work_ctx is None:
+            return contextlib.nullcontext()
+        return self._chat_work_ctx(chat_id)
+
+    def wake(self):
+        self._wake.set()
+
+    async def _idle(self, seconds: float):
+        """Idle wait that ends on stop or (dynamic) on a target-set change."""
+        if self._stop.is_set():
+            return
+        stop_t = asyncio.ensure_future(self._stop.wait())
+        wake_t = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({stop_t, wake_t}, timeout=seconds,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (stop_t, wake_t):
+                t.cancel()
+            await asyncio.gather(stop_t, wake_t, return_exceptions=True)
+            self._wake.clear()
 
     # -- public lifecycle ----------------------------------------------------
     async def start(self, targets: list[str]) -> int:
@@ -199,142 +250,43 @@ class Collector:
             self.progress_timeout, self.media_hw, self.media_lw)
         try:
             if self._participants_sync:
-                for cid in self._targets:
+                for cid in list(self._targets):
                     if self._stop.is_set():
                         return
+                    if not self._is_active(cid):
+                        continue
                     try:
-                        await self.sync_participants(cid)
+                        async with self._begin_chat_work(cid):
+                            await self.sync_participants(cid)
+                    except _TargetInactive:
+                        continue
+                    except asyncio.CancelledError:
+                        continue
                     except Exception as e:
                         log.warning("participants sync %s: %s", cid, e)
 
             while not self._stop.is_set():
                 any_progress = False
-                for cid in self._targets:
+                for cid in list(self._targets):
                     if self._stop.is_set():
                         break
-
-                    # v6: coordinator heartbeat so health sees aliveness
-                    await self.storage.coordinator_heartbeat(cid)
-
-                    # v7.3: media backpressure - true hysteresis.
-                    # Invariant: no new backfill batch starts while DB pending
-                    # is >= media_lw. The v7.2 variant (60-iteration cap then
-                    # unconditional resume) could kick off a new 2000-msg batch
-                    # with pending still far above HWM, growing the backlog.
-                    # Here we stay paused until pending actually drops below
-                    # LWM or _stop is set, but keep heartbeating, re-sweeping
-                    # the in-memory queue, and watching for silently-dead
-                    # workers (done_count stops changing while q_depth > 0).
-                    pending = await self._media_pending_count()
-                    if pending > self.media_hw:
-                        log.info("backpressure: media pending %s > hw %s - pausing backfill",
-                                 pending, self.media_hw)
-                        await self.storage.set_backfill_status(
-                            cid, "syncing_paused_media_backpressure")
-                        last_done_check_at = datetime.now(timezone.utc)
-                        last_done_count = await self._media_done_count()
-                        while pending >= self.media_lw and not self._stop.is_set():
-                            try:
-                                await asyncio.wait_for(self._stop.wait(), timeout=10)
-                                break  # _stop was set
-                            except asyncio.TimeoutError:
-                                pass
-                            pending = await self._media_pending_count()
-                            await self.storage.coordinator_heartbeat(cid)
-                            # resweep if in-memory queue has drained
-                            try:
-                                q_depth = (self.media_q.queue.qsize()
-                                           + len(self.media_q._inflight))
-                                if q_depth < 50:
-                                    swept = await self.media_q.sweep_retryable(
-                                        limit=50)
-                                    if swept:
-                                        log.info(
-                                            "backpressure: resweep queued %s "
-                                            "items (pending=%s q_depth=%s)",
-                                            swept, pending, q_depth)
-                            except Exception:
-                                log.exception("backpressure resweep failed")
-                            # periodic liveness check for media workers:
-                            # if done_count hasn't moved for 5 min while q_depth
-                            # >0 we log a warning (don't force degraded to
-                            # avoid false positives on legitimately slow
-                            # downloads, e.g. one large video).
-                            now = datetime.now(timezone.utc)
-                            if (now - last_done_check_at).total_seconds() >= 300:
-                                cur_done = await self._media_done_count()
-                                if (cur_done == last_done_count
-                                        and q_depth > 0
-                                        and not self._stop.is_set()):
-                                    log.warning(
-                                        "backpressure: media workers made no "
-                                        "progress for 5 min (done=%s, q_depth=%s); "
-                                        "coordinator remains paused and will keep "
-                                        "re-sweeping, but media pipeline may be "
-                                        "stuck - inspect media worker heartbeats.",
-                                        cur_done, q_depth)
-                                last_done_count = cur_done
-                                last_done_check_at = now
-                        if self._stop.is_set():
-                            continue
-                        # pending < LWM -> hysteresis resume
-                        log.info("backpressure: resume (pending=%s < lw=%s)",
-                                 pending, self.media_lw)
-                        await self.storage.set_backfill_status(cid, "syncing")
-
-                    # v6: batch with hard timeout + progress watchdog
-                    batch_start = datetime.now(timezone.utc)
-                    added = 0; status = "syncing"; more = False
-                    reason = None; ok = True
+                    if not self._is_active(cid):
+                        continue
                     try:
-                        added, status, more = await asyncio.wait_for(
-                            self.backfill(cid), timeout=self.batch_timeout)
-                        if added:
+                        async with self._begin_chat_work(cid):
+                            progressed = await self._coordinator_chat_round(cid)
+                        if progressed:
                             any_progress = True
-                    except asyncio.TimeoutError:
-                        ok = False
-                        reason = f"batch_timeout_{self.batch_timeout}s"
-                        log.warning("batch TIMEOUT on %s after %ss - recovering",
-                                    cid, self.batch_timeout)
-                        await self._recover_after_stall(cid, reason)
+                    except _TargetInactive:
+                        continue
+                    except asyncio.CancelledError:
+                        continue
                     except Exception as e:
-                        ok = False
-                        reason = f"{type(e).__name__}: {e}"[:300]
-                        log.exception("coordinator batch failed on %s", cid)
+                        log.exception("coordinator round failed on %s", cid)
                         await self.storage.record_error(
-                            "coordinator_batch", cid, None, None, e)
-                        await self._recover_after_stall(cid, reason)
+                            "coordinator_round", cid, None, None, e)
 
-                    dur = int((datetime.now(timezone.utc) - batch_start).total_seconds())
-                    await self.storage.coordinator_batch_end(
-                        cid, added, dur, ok, reason)
-
-                    if not ok:
-                        if await self._sleep_or_stop(self.recovery_backoff):
-                            break
-                        prog = await self._coord_progress_row(cid)
-                        if prog and prog.get("consecutive_batch_failures", 0) >= self.max_consecutive_failures:
-                            log.error("target %s DEGRADED after %s consecutive failures",
-                                      cid, prog["consecutive_batch_failures"])
-                            await self.storage.set_backfill_status(cid, "degraded")
-                            # longer sleep before next attempt
-                            try:
-                                await asyncio.wait_for(
-                                    self._stop.wait(),
-                                    timeout=self.recovery_backoff * 10)
-                            except asyncio.TimeoutError:
-                                pass
-
-                    if ok and not more and status in ("complete", "complete_with_errors"):
-                        await self.retry_dead_letter(cid)
-
-                    if ok and more:
-                        try:
-                            await asyncio.wait_for(
-                                self._stop.wait(), timeout=self.batch_pause)
-                        except asyncio.TimeoutError:
-                            pass
-
+                # Shutdown requested during the target loop: skip the
                 # Shutdown requested during the target loop: skip the
                 # post-round maintenance (it makes Telegram calls) and exit.
                 if self._stop.is_set():
@@ -364,19 +316,143 @@ class Collector:
                         any_more = True
                         break
                 if not any_progress and not any_more:
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=60)
-                    except asyncio.TimeoutError:
-                        pass
+                    await self._idle(60)
                 elif not any_progress:
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=2)
-                    except asyncio.TimeoutError:
-                        pass
+                    await self._idle(2)
         finally:
             log.info("coordinator stopped")
 
+    async def _coordinator_chat_round(self, cid: int) -> bool:
+        """One pass of the coordinator over a single chat: heartbeat,
+        backpressure handling, one backfill batch, DLQ sweep. Runs inside
+        the caller's per-chat work context (dynamic: holds the lease),
+        so every write below is attributable to the chat. Returns True
+        if the batch made progress."""
+        any_progress = False
+        await self.storage.coordinator_heartbeat(cid)
+
+        # v7.3: media backpressure - true hysteresis.
+        # Invariant: no new backfill batch starts while DB pending
+        # is >= media_lw. The v7.2 variant (60-iteration cap then
+        # unconditional resume) could kick off a new 2000-msg batch
+        # with pending still far above HWM, growing the backlog.
+        # Here we stay paused until pending actually drops below
+        # LWM or _stop is set, but keep heartbeating, re-sweeping
+        # the in-memory queue, and watching for silently-dead
+        # workers (done_count stops changing while q_depth > 0).
+        pending = await self._media_pending_count()
+        if pending > self.media_hw:
+            log.info("backpressure: media pending %s > hw %s - pausing backfill",
+                     pending, self.media_hw)
+            await self.storage.set_backfill_status(
+                cid, "syncing_paused_media_backpressure")
+            last_done_check_at = datetime.now(timezone.utc)
+            last_done_count = await self._media_done_count()
+            while (pending >= self.media_lw and not self._stop.is_set()
+                   and self._is_active(cid)):
+                await self._idle(10)
+                if self._stop.is_set() or not self._is_active(cid):
+                    break
+                pending = await self._media_pending_count()
+                await self.storage.coordinator_heartbeat(cid)
+                # resweep if in-memory queue has drained
+                try:
+                    q_depth = (self.media_q.queue.qsize()
+                               + len(self.media_q._inflight))
+                    if q_depth < 50:
+                        swept = await self.media_q.sweep_retryable(
+                            limit=50)
+                        if swept:
+                            log.info(
+                                "backpressure: resweep queued %s "
+                                "items (pending=%s q_depth=%s)",
+                                swept, pending, q_depth)
+                except Exception:
+                    log.exception("backpressure resweep failed")
+                # periodic liveness check for media workers:
+                # if done_count hasn't moved for 5 min while q_depth
+                # >0 we log a warning (don't force degraded to
+                # avoid false positives on legitimately slow
+                # downloads, e.g. one large video).
+                now = datetime.now(timezone.utc)
+                if (now - last_done_check_at).total_seconds() >= 300:
+                    cur_done = await self._media_done_count()
+                    if (cur_done == last_done_count
+                            and q_depth > 0
+                            and not self._stop.is_set()):
+                        log.warning(
+                            "backpressure: media workers made no "
+                            "progress for 5 min (done=%s, q_depth=%s); "
+                            "coordinator remains paused and will keep "
+                            "re-sweeping, but media pipeline may be "
+                            "stuck - inspect media worker heartbeats.",
+                            cur_done, q_depth)
+                    last_done_count = cur_done
+                    last_done_check_at = now
+            if self._stop.is_set() or not self._is_active(cid):
+                return any_progress
+            # pending < LWM -> hysteresis resume
+            log.info("backpressure: resume (pending=%s < lw=%s)",
+                     pending, self.media_lw)
+            await self.storage.set_backfill_status(cid, "syncing")
+
+        # v6: batch with hard timeout + progress watchdog
+        batch_start = datetime.now(timezone.utc)
+        added = 0; status = "syncing"; more = False
+        reason = None; ok = True
+        try:
+            added, status, more = await asyncio.wait_for(
+                self.backfill(cid), timeout=self.batch_timeout)
+            if added:
+                any_progress = True
+        except asyncio.TimeoutError:
+            ok = False
+            reason = f"batch_timeout_{self.batch_timeout}s"
+            log.warning("batch TIMEOUT on %s after %ss - recovering",
+                        cid, self.batch_timeout)
+            await self._recover_after_stall(cid, reason)
+        except Exception as e:
+            ok = False
+            reason = f"{type(e).__name__}: {e}"[:300]
+            log.exception("coordinator batch failed on %s", cid)
+            await self.storage.record_error(
+                "coordinator_batch", cid, None, None, e)
+            await self._recover_after_stall(cid, reason)
+
+        dur = int((datetime.now(timezone.utc) - batch_start).total_seconds())
+        await self.storage.coordinator_batch_end(
+            cid, added, dur, ok, reason)
+
+        if not ok:
+            if await self._sleep_or_stop(self.recovery_backoff):
+                return any_progress
+            prog = await self._coord_progress_row(cid)
+            if prog and prog.get("consecutive_batch_failures", 0) >= self.max_consecutive_failures:
+                log.error("target %s DEGRADED after %s consecutive failures",
+                          cid, prog["consecutive_batch_failures"])
+                await self.storage.set_backfill_status(cid, "degraded")
+                # longer sleep before next attempt
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(),
+                        timeout=self.recovery_backoff * 10)
+                except asyncio.TimeoutError:
+                    pass
+
+        if ok and not more and status in ("complete", "complete_with_errors"):
+            await self.retry_dead_letter(cid)
+
+        if ok and more:
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.batch_pause)
+            except asyncio.TimeoutError:
+                pass
+        return any_progress
+
     async def _media_pending_count(self) -> int:
+        if self._dynamic:
+            return await self.storage.media_pending_count_for(list(self._targets))
         async with self.storage.pool.acquire() as con:
             return await con.fetchval(
                 "SELECT COUNT(*) FROM media WHERE status='pending'")
@@ -426,7 +502,11 @@ class Collector:
     async def _refresh_media_needing_refresh(self):
         """Re-fetch messages whose file_reference expired, then let the normal
         media queue re-download them with the fresh reference."""
-        rows = await self.storage.media_needs_refresh(limit=20)
+        if self._dynamic:
+            rows = await self.storage.media_needs_refresh(
+                limit=20, chat_ids=list(self._targets))
+        else:
+            rows = await self.storage.media_needs_refresh(limit=20)
         if not rows:
             return
         for r in rows:
@@ -658,11 +738,14 @@ class Collector:
         if self._stop.is_set():
             log.info("backfill chat=%s skipped: shutdown in progress", chat_id)
             return (0, "stopped", False)
+        if not self._is_active(chat_id):
+            return (0, "inactive", False)
         entity = await self.client.get_entity(chat_id)
         limit = batch_size if batch_size is not None else self.batch_size
         count_total = 0
         stopped_on_limit = False
         stopped = False
+        inactive = False
         last_id = None
         first_id = None
         # (Re-)read pending floor from DB.
@@ -673,6 +756,9 @@ class Collector:
             # Never (re-)open the iterator once shutdown has been requested.
             if self._stop.is_set():
                 stopped = True
+                break
+            if not self._is_active(chat_id):
+                inactive = True
                 break
             state = await self.storage.get_sync_state(chat_id)
             min_id = int(state["last_backfilled_message_id"] or 0) if state else 0
@@ -691,6 +777,9 @@ class Collector:
                     # was not started is not processed and not checkpointed.
                     if self._stop.is_set():
                         stopped = True
+                        break
+                    if not self._is_active(chat_id):
+                        inactive = True
                         break
                     ok = await self._process_backfill_message(chat_id, msg)
                     if ok:
@@ -713,6 +802,9 @@ class Collector:
                         break
                 # natural end of iterator (or stop / limit break above)
                 break
+            except _TargetInactive:
+                inactive = True
+                break
             except errors.FloodWaitError as e:
                 wait = min(int(e.seconds) + 2, 3600)
                 log.warning("backfill FloodWait %ss on %s; resuming after sleep", wait, chat_id)
@@ -732,6 +824,14 @@ class Collector:
 
             if stopped_on_limit:
                 break
+
+        if inactive:
+            # Target left the active set (dynamic engine): every processed
+            # message already advanced its checkpoint; nothing is classified
+            # and nothing more is written for this chat.
+            log.info("backfill chat=%s stopped: target inactive; processed=%s",
+                     chat_id, count_total)
+            return (count_total, "inactive", False)
 
         if stopped or self._stop.is_set():
             # Shutdown: keep the checkpoint of the last successfully processed
@@ -800,6 +900,8 @@ class Collector:
             except errors.FloodWaitError:
                 raise
             except Exception as e:
+                if is_inactive_write(e):
+                    raise _TargetInactive() from None
                 last_err = e
                 await asyncio.sleep(min(10, 0.5 * (2 ** (attempt - 1))))
         # Retries exhausted: dead-letter and keep going; checkpoint will be
@@ -825,10 +927,15 @@ class Collector:
             target = min(target, floor - 1)
         if target <= 0:
             return
+        if self._dynamic:
+            await self.storage.set_backfill_checkpoint_if_enabled(chat_id, target, first_id)
+            return
         await self.storage.set_backfill_checkpoint(chat_id, target, first_id)
 
     async def retry_dead_letter(self, chat_id: int):
         """Walk the backfill_queue and attempt to process pending items again."""
+        if not self._is_active(chat_id):
+            return
         entity = await self.client.get_entity(chat_id)
         total = 0
         succeeded = 0
@@ -836,7 +943,11 @@ class Collector:
             pending = await self.storage.backfill_queue_get_pending(chat_id, limit=50)
             if not pending:
                 break
+            if not self._is_active(chat_id):
+                return
             for row in pending:
+                if not self._is_active(chat_id):
+                    return
                 total += 1
                 mid = row["message_id"]
                 try:
@@ -863,6 +974,8 @@ class Collector:
                     await self.storage.backfill_queue_mark_done(chat_id, mid)
                     succeeded += 1
                 except Exception as e:
+                    if is_inactive_write(e):
+                        return
                     log.warning("dlq handle (%s,%s) err: %s", chat_id, mid, e)
                     await self.storage.backfill_queue_upsert(
                         chat_id, mid, f"handle: {e}"[:500],
@@ -946,7 +1059,7 @@ class Collector:
             self._spawn_bg(
                 self._safe_ensure_user(sender_user_id, sender=sender_entity,
                                        hint_chat=cid, hint_msg=msg.id),
-                name=f"user:{sender_user_id}")
+                name=f"user:{sender_user_id}", chat_id=cid)
 
         # Descriptor first (pure function): we need media_type/file_id in the
         # messages row BEFORE anything else touches message_media (FK).
@@ -1068,7 +1181,7 @@ class Collector:
             await self.storage.replace_reactions(cid, msg.id, reaction_rows)
             if self._fetch_reaction_authors:
                 self._spawn_bg(self._safe_fetch_reaction_authors(cid, msg.id),
-                               name=f"react_auth:{cid}:{msg.id}")
+                               name=f"react_auth:{cid}:{msg.id}", chat_id=cid)
 
         # Media enqueue AFTER message upsert so FK(message_media -> messages)
         # has a parent row to point at.
@@ -1108,7 +1221,7 @@ class Collector:
             pass
         if self._fetch_reaction_authors:
             self._spawn_bg(self._safe_fetch_reaction_authors(cid, msg_id),
-                           name=f"react_auth_live:{cid}:{msg_id}")
+                           name=f"react_auth_live:{cid}:{msg_id}", chat_id=cid)
 
     async def _safe_fetch_reaction_authors(self, chat_id: int, msg_id: int):
         async with self._react_authors_sema:
@@ -1593,20 +1706,28 @@ class Collector:
         return None
 
     # -- background tasks ----------------------------------------------------
-    def _spawn_bg(self, coro, name: str):
+    def _spawn_bg(self, coro, name: str, chat_id: int | None = None):
         async def _runner():
             async with self._bg_sema:
                 try:
                     await coro
+                except asyncio.CancelledError:
+                    # Expected on chat disable / shutdown.
+                    raise
                 except Exception as e:
+                    if is_inactive_write(e):
+                        log.debug("bg %s: target %s disabled during write", name, chat_id)
+                        return
                     log.warning("bg %s failed: %s", name, e)
                     try:
-                        await self.storage.record_error("bg_" + name, None, None, None, e)
+                        await self.storage.record_error("bg_" + name, chat_id, None, None, e)
                     except Exception:
                         pass
         t = asyncio.create_task(_runner(), name=name)
         self._bg_tasks.add(t)
         t.add_done_callback(self._bg_tasks.discard)
+        if chat_id is not None and self._bg_spawn_hook is not None:
+            self._bg_spawn_hook(chat_id, t)
         return t
 
 

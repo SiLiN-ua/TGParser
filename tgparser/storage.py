@@ -2302,3 +2302,197 @@ class Storage:
                     "VALUES ($1, TRUE, FALSE, 'yaml_import') "
                     "ON CONFLICT (chat_id) DO NOTHING RETURNING chat_id", int(chat_id))
                 return created is not None
+
+    # ========================================================================
+    # v11: atomic admin-CLI wrappers (mutation + audit in one transaction).
+    # Each returns a result dict with ok/reason and the fields the CLI prints.
+    # An audit row is written inside the same transaction for every outcome
+    # (ok / rejected). If the audit INSERT or read-back raises, the whole
+    # transaction rolls back together with the mutation.
+    # ========================================================================
+    async def _admin_audit(self, con, actor: str, action: str, outcome: str,
+                           detail: dict):
+        if actor not in self.AUDIT_ACTORS:
+            raise ValueError("bad audit actor")
+        if outcome not in self.AUDIT_OUTCOMES:
+            raise ValueError("bad audit outcome")
+        if not self._AUDIT_ACTION_RX.match(action or ""):
+            raise ValueError("bad audit action")
+        d = self._audit_detail(detail)
+        await con.execute(
+            "INSERT INTO ui_audit_log (actor, action, outcome, detail) "
+            "VALUES ($1,$2,$3,$4::jsonb)",
+            actor, action, outcome, json.dumps(d, ensure_ascii=False))
+
+    @_with_db_retry()
+    async def admin_gate_update(self, *, enable: bool, from_enabled: bool,
+                                actor: str, action: str, note: str | None,
+                                detail: dict, expected_dyn_engine: bool) -> dict:
+        """Atomic: deployment_gates UPDATE + ui_audit_log INSERT in one tx.
+        Preconditions enforced inside the tx against the gates row FOR UPDATE:
+          - schema_version == 11;
+          - runtime_state.dyn_engine == expected_dyn_engine;
+          - deployment_gates.enabled == from_enabled;
+          - UPDATE affects exactly 1 row;
+          - read-back confirms enabled == enable.
+        Any failing precondition writes a 'rejected' audit and returns
+        ok=False. A read-back or audit INSERT failure rolls back the UPDATE."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                row = await con.fetchrow(
+                    "SELECT enabled FROM deployment_gates WHERE key='dynamic_targets' "
+                    "FOR UPDATE")
+                schema = int(await con.fetchval(
+                    "SELECT COALESCE(max(version),0) FROM schema_migrations"))
+                if schema != 11:
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "schema_not_v11"})
+                    return {"ok": False, "reason": "schema_not_v11",
+                            "schema": schema}
+                rt_dyn = await con.fetchval(
+                    "SELECT dyn_engine FROM runtime_state WHERE id=1")
+                if bool(rt_dyn) is not bool(expected_dyn_engine):
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "dyn_engine_mismatch"})
+                    return {"ok": False, "reason": "dyn_engine_mismatch",
+                            "dyn_engine": bool(rt_dyn),
+                            "expected_dyn_engine": bool(expected_dyn_engine)}
+                if bool(row["enabled"]) is not bool(from_enabled):
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "gate_state_mismatch"})
+                    return {"ok": False, "reason": "gate_state_mismatch",
+                            "current": bool(row["enabled"])}
+                res = await con.execute(
+                    "UPDATE deployment_gates SET enabled=$1, updated_at=NOW(), "
+                    "updated_by=$2, note=$3 WHERE key='dynamic_targets' "
+                    "AND enabled=$4",
+                    enable, actor[:80], (note or "")[:1000], from_enabled)
+                if not res.endswith(" 1"):
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "update_rowcount"})
+                    return {"ok": False, "reason": "update_rowcount"}
+                new = await con.fetchrow(
+                    "SELECT enabled, updated_at, updated_by, note "
+                    "FROM deployment_gates WHERE key='dynamic_targets'")
+                if bool(new["enabled"]) is not bool(enable):
+                    raise RuntimeError("gate read-back mismatch")
+                await self._admin_audit(con, actor, action, "ok", detail)
+                return {"ok": True, "enabled": bool(new["enabled"]),
+                        "updated_at": new["updated_at"],
+                        "updated_by": new["updated_by"]}
+
+    @_with_db_retry()
+    async def admin_preference_update(self, *, chat_id: int,
+                                      selected: bool | None,
+                                      excluded: bool | None,
+                                      note: str | None,
+                                      actor: str, action: str,
+                                      detail: dict,
+                                      expected_requested_version: int | None
+                                      ) -> dict:
+        """Atomic: target_preferences upsert + audit in one tx. Checks
+        policy_state.requested_version == expected (when expected is not
+        None) under FOR UPDATE and refuses on mismatch. Returns new
+        requested_version after the upsert (may equal old if the write was
+        idempotent and no intent trigger bumped)."""
+        if selected is True and excluded is True:
+            raise ValueError("selected and excluded cannot both be true")
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ps = await con.fetchrow(
+                    "SELECT requested_version FROM policy_state WHERE id=1 FOR UPDATE")
+                before = int(ps["requested_version"])
+                if expected_requested_version is not None \
+                        and before != int(expected_requested_version):
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "stale_version",
+                                             "version": before})
+                    return {"ok": False, "reason": "stale_version",
+                            "current_requested_version": before}
+                await con.execute(
+                    "INSERT INTO target_preferences "
+                    "  (chat_id, selected, excluded, note, updated_at, updated_by) "
+                    "VALUES ($1, COALESCE($2, FALSE), COALESCE($3, FALSE), $4, NOW(), $5) "
+                    "ON CONFLICT (chat_id) DO UPDATE SET "
+                    "  selected = COALESCE($2, target_preferences.selected), "
+                    "  excluded = COALESCE($3, target_preferences.excluded), "
+                    "  note = COALESCE($4, target_preferences.note), "
+                    "  updated_at = NOW(), updated_by = $5",
+                    chat_id, selected, excluded, note, actor[:80])
+                after = int(await con.fetchval(
+                    "SELECT requested_version FROM policy_state WHERE id=1"))
+                await self._admin_audit(con, actor, action, "ok",
+                                        {**detail, "version": after})
+                return {"ok": True,
+                        "requested_version_before": before,
+                        "requested_version_after": after,
+                        "chat_id": int(chat_id)}
+
+    @_with_db_retry()
+    async def admin_confirm_mass_gone(self, *, policy_version: int,
+                                      fingerprint: str, actor: str,
+                                      action: str, detail: dict) -> dict:
+        """Atomic: confirm_mass_gone + audit. Exact match required on
+        blocked_version, blocked_fingerprint and requested_version."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ps = await con.fetchrow(
+                    "SELECT blocked_version, blocked_fingerprint, requested_version, "
+                    "       blocked_count FROM policy_state WHERE id=1 FOR UPDATE")
+                if (ps["blocked_version"] != policy_version
+                        or ps["blocked_fingerprint"] != fingerprint
+                        or ps["requested_version"] != policy_version):
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "stale_block",
+                                             "version": int(ps["requested_version"])})
+                    return {"ok": False, "reason": "stale_block",
+                            "blocked_version": ps["blocked_version"],
+                            "requested_version": int(ps["requested_version"])}
+                await con.execute(
+                    "UPDATE policy_state SET confirmed_version=$1, "
+                    "confirmed_fingerprint=$2, confirmed_at=NOW(), "
+                    "confirmed_by=$3 WHERE id=1",
+                    policy_version, fingerprint, actor)
+                await con.execute(
+                    "INSERT INTO policy_block_history "
+                    "(event, policy_version, fingerprint, gone_count, actor) "
+                    "VALUES ('confirmed',$1,$2,$3,$4)",
+                    policy_version, fingerprint, ps["blocked_count"], actor)
+                await self._admin_audit(con, actor, action, "ok",
+                                        {**detail, "version": policy_version})
+                return {"ok": True, "confirmed_version": policy_version}
+
+    @_with_db_retry()
+    async def admin_request_discovery(self, *, actor: str, action: str,
+                                      detail: dict) -> dict:
+        """Atomic: discovery request + audit. Refuses if a pending request is
+        not yet consumed, or next_allowed_at is in the future."""
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                ctl = await con.fetchrow(
+                    "SELECT requested_seq, consumed_seq, last_requested_at, "
+                    "       next_allowed_at, "
+                    "       (next_allowed_at IS NOT NULL "
+                    "        AND next_allowed_at > NOW()) AS throttled "
+                    "FROM discovery_control WHERE id=1 FOR UPDATE")
+                if ctl["requested_seq"] > ctl["consumed_seq"]:
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "pending_request",
+                                             "seq": int(ctl["requested_seq"])})
+                    return {"ok": False, "reason": "pending_request",
+                            "requested_seq": int(ctl["requested_seq"]),
+                            "consumed_seq": int(ctl["consumed_seq"])}
+                if ctl["throttled"]:
+                    await self._admin_audit(con, actor, action, "rejected",
+                                            {**detail, "reason": "throttled"})
+                    return {"ok": False, "reason": "throttled",
+                            "next_allowed_at": ctl["next_allowed_at"]}
+                new_seq = int(await con.fetchval(
+                    "UPDATE discovery_control SET "
+                    "  requested_seq = requested_seq + 1, "
+                    "  last_requested_at = NOW(), last_requested_by=$1 "
+                    "WHERE id=1 RETURNING requested_seq",
+                    actor[:80]))
+                await self._admin_audit(con, actor, action, "ok",
+                                        {**detail, "seq": new_seq})
+                return {"ok": True, "requested_seq": new_seq}

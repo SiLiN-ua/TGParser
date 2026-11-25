@@ -337,12 +337,13 @@ async def _pref_mutate(storage, service, *, chat_id: int,
     return _emit(res, ok=bool(res.get("ok")))
 
 
-async def cmd_pref_select(storage, service, chat, note):
+async def cmd_pref_select(storage, service, chat, expected_version, note):
     return await _pref_mutate(storage, service,
                               chat_id=chat, selected=True, excluded=None,
                               note=note, action="prefs.select",
                               requires_disable_confirmation=False,
-                              confirm_chat_id=None, expected_version=None)
+                              confirm_chat_id=None,
+                              expected_version=expected_version)
 
 
 async def cmd_pref_unselect(storage, service, chat, confirm_chat_id,
@@ -480,6 +481,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pl = pref.add_parser("list"); pl.add_argument("--chat", type=int)
     psel = pref.add_parser("select")
     psel.add_argument("--chat", type=int, required=True)
+    psel.add_argument("--expected-policy-version", type=int, required=True)
     psel.add_argument("--note")
     for name in ("unselect", "clear", "exclude"):
         sp = pref.add_parser(name)
@@ -520,7 +522,9 @@ async def _dispatch(args, storage: Storage, service: ServiceState) -> int:
         if cmd == "list":
             return await cmd_preferences_list(storage, service, args.chat)
         if cmd == "select":
-            return await cmd_pref_select(storage, service, args.chat, args.note)
+            return await cmd_pref_select(storage, service, args.chat,
+                                         args.expected_policy_version,
+                                         args.note)
         if cmd == "unselect":
             return await cmd_pref_unselect(storage, service, args.chat,
                                            args.confirm_chat_id,

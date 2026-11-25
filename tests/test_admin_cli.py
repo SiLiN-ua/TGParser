@@ -205,17 +205,26 @@ async def _seed_discovered(storage, chat_id):
             "VALUES ($1, 'megagroup', 'T') ON CONFLICT DO NOTHING", chat_id)
 
 
+async def _current_version(storage) -> int:
+    async with storage.pool.acquire() as con:
+        return int(await con.fetchval(
+            "SELECT requested_version FROM policy_state"))
+
+
 @pytest.mark.asyncio
 async def test_preferences_select_bumps_version_and_audits(temp_storage, capsys):
     cid = -1001234567890
     await _seed_discovered(temp_storage, cid)
+    v = await _current_version(temp_storage)
     rc, out, _ = await _run_cli(
-        ["preferences", "select", "--chat", str(cid)],
+        ["preferences", "select", "--chat", str(cid),
+         "--expected-policy-version", str(v)],
         temp_storage, capsys=capsys)
     assert rc == 0
     d = json.loads(out)
     assert d["ok"] is True
-    assert d["requested_version_after"] > d["requested_version_before"]
+    assert d["requested_version_before"] == v
+    assert d["requested_version_after"] == v + 1
     async with temp_storage.pool.acquire() as con:
         sel = await con.fetchval(
             "SELECT selected FROM target_preferences WHERE chat_id=$1", cid)
@@ -224,6 +233,117 @@ async def test_preferences_select_bumps_version_and_audits(temp_storage, capsys)
             "WHERE action='prefs.select' AND outcome='ok'")
     assert sel is True
     assert audits == 1
+
+
+@pytest.mark.asyncio
+async def test_preferences_select_rejects_stale_version(temp_storage, capsys):
+    """CLI must refuse select when --expected-policy-version != current."""
+    cid = -1001234567890
+    await _seed_discovered(temp_storage, cid)
+    v = await _current_version(temp_storage)
+    rc, out, _ = await _run_cli(
+        ["preferences", "select", "--chat", str(cid),
+         "--expected-policy-version", str(v - 1)],
+        temp_storage, capsys=capsys)
+    assert rc == 1
+    d = json.loads(out)
+    assert d["reason"] == "stale_version"
+    assert d["current_requested_version"] == v
+    async with temp_storage.pool.acquire() as con:
+        rows = await con.fetchval(
+            "SELECT COUNT(*) FROM target_preferences WHERE chat_id=$1", cid)
+        v_after = int(await con.fetchval(
+            "SELECT requested_version FROM policy_state"))
+        rejects = await con.fetchval(
+            "SELECT COUNT(*) FROM ui_audit_log "
+            "WHERE action='prefs.select' AND outcome='rejected'")
+    assert rows == 0                  # no row created
+    assert v_after == v               # no bump
+    assert rejects == 1
+
+
+@pytest.mark.asyncio
+async def test_preferences_select_concurrent_policy_change_refuses(temp_storage,
+                                                                   capsys):
+    """Simulates: operator did dry-run at version V; between dry-run and
+    select, another intent change bumped the version. The select-with-
+    --expected-policy-version=V must refuse without mutation."""
+    cid_a = -1001234567890
+    cid_b = -1001234567891
+    await _seed_discovered(temp_storage, cid_a)
+    await _seed_discovered(temp_storage, cid_b)
+    observed = await _current_version(temp_storage)
+    # Concurrent intent change between dry-run and select:
+    await _run_cli(
+        ["preferences", "select", "--chat", str(cid_b),
+         "--expected-policy-version", str(observed)],
+        temp_storage, capsys=capsys)
+    capsys.readouterr()
+    # Operator attempts select with the stale version they observed earlier.
+    rc, out, _ = await _run_cli(
+        ["preferences", "select", "--chat", str(cid_a),
+         "--expected-policy-version", str(observed)],
+        temp_storage, capsys=capsys)
+    assert rc == 1
+    d = json.loads(out)
+    assert d["reason"] == "stale_version"
+    assert d["current_requested_version"] == observed + 1
+    async with temp_storage.pool.acquire() as con:
+        n_a = await con.fetchval(
+            "SELECT COUNT(*) FROM target_preferences WHERE chat_id=$1", cid_a)
+    assert n_a == 0, "the refused select must not have inserted a row"
+
+
+@pytest.mark.asyncio
+async def test_preferences_select_audit_rollback_on_audit_failure(
+        temp_storage, capsys, monkeypatch):
+    """If the audit INSERT raises after a successful preference upsert, the
+    whole transaction (preference + audit) must roll back together."""
+    cid = -1001234567890
+    await _seed_discovered(temp_storage, cid)
+    v = await _current_version(temp_storage)
+
+    async def boom(*a, **kw):
+        raise RuntimeError("synthetic audit failure")
+    monkeypatch.setattr(temp_storage, "_admin_audit", boom)
+    with pytest.raises(RuntimeError):
+        await _run_cli(
+            ["preferences", "select", "--chat", str(cid),
+             "--expected-policy-version", str(v)],
+            temp_storage, capsys=capsys)
+    async with temp_storage.pool.acquire() as con:
+        n = await con.fetchval(
+            "SELECT COUNT(*) FROM target_preferences WHERE chat_id=$1", cid)
+        v_after = int(await con.fetchval(
+            "SELECT requested_version FROM policy_state"))
+        a = await con.fetchval("SELECT COUNT(*) FROM ui_audit_log")
+    assert n == 0
+    assert v_after == v
+    assert a == 0
+
+
+@pytest.mark.asyncio
+async def test_preferences_select_idempotent_no_double_bump(temp_storage, capsys):
+    """Second select on the same chat_id with the same values must NOT bump
+    requested_version (statement trigger uses EXCEPT ALL — no net change)."""
+    cid = -1001234567890
+    await _seed_discovered(temp_storage, cid)
+    v0 = await _current_version(temp_storage)
+    rc1, out1, _ = await _run_cli(
+        ["preferences", "select", "--chat", str(cid),
+         "--expected-policy-version", str(v0)],
+        temp_storage, capsys=capsys)
+    assert rc1 == 0
+    v1 = int(json.loads(out1)["requested_version_after"])
+    assert v1 == v0 + 1
+    rc2, out2, _ = await _run_cli(
+        ["preferences", "select", "--chat", str(cid),
+         "--expected-policy-version", str(v1)],
+        temp_storage, capsys=capsys)
+    assert rc2 == 0
+    v2 = int(json.loads(out2)["requested_version_after"])
+    assert v2 == v1, (
+        f"idempotent select must not bump policy version; got {v1} -> {v2}")
 
 
 @pytest.mark.asyncio
@@ -244,7 +364,9 @@ async def test_preferences_unselect_refuses_stale_version(temp_storage, capsys):
     cid = -1001234567890
     await _seed_discovered(temp_storage, cid)
     # bump version via a select first
-    await _run_cli(["preferences", "select", "--chat", str(cid)],
+    v0 = await _current_version(temp_storage)
+    await _run_cli(["preferences", "select", "--chat", str(cid),
+                    "--expected-policy-version", str(v0)],
                    temp_storage, capsys=capsys)
     capsys.readouterr()
     async with temp_storage.pool.acquire() as con:
@@ -305,9 +427,12 @@ async def test_preferences_select_rejects_when_excluded(temp_storage, capsys):
     assert rc == 0
     capsys.readouterr()
     # now selecting must be rejected: DB CHECK tp_not_both catches it.
+    v_now = await _current_version(temp_storage)
     with pytest.raises(asyncpg.exceptions.CheckViolationError):
-        await _run_cli(["preferences", "select", "--chat", str(cid)],
-                       temp_storage, capsys=capsys)
+        await _run_cli(
+            ["preferences", "select", "--chat", str(cid),
+             "--expected-policy-version", str(v_now)],
+            temp_storage, capsys=capsys)
 
 
 # --------------------------- mass-gone confirm -----------------------------
@@ -397,19 +522,29 @@ async def test_concurrent_pref_updates_do_not_lose_version(temp_storage, capsys)
         start = int(await con.fetchval(
             "SELECT requested_version FROM policy_state"))
     # Run concurrently using two storage sessions (simulate two CLI procs).
+    # Both pass the SAME observed version; FOR UPDATE on policy_state
+    # serializes them: the first wins and bumps, the second loses with
+    # stale_version. Both rcs are observed, exactly one succeeds.
     async def _run(cid):
         svc = _service()
         rc = await cli._main_async(
-            ["preferences", "select", "--chat", str(cid)],
+            ["preferences", "select", "--chat", str(cid),
+             "--expected-policy-version", str(start)],
             storage=temp_storage, service=svc)
         capsys.readouterr()  # discard
         return rc
-    rcs = await asyncio.gather(_run(a), _run(b))
-    assert rcs == [0, 0]
+    rcs = sorted(await asyncio.gather(_run(a), _run(b)))
+    assert rcs == [0, 1], (
+        f"expected one success and one stale_version refusal, got {rcs}")
     async with temp_storage.pool.acquire() as con:
         after = int(await con.fetchval(
             "SELECT requested_version FROM policy_state"))
-        n = int(await con.fetchval(
+        n_sel = int(await con.fetchval(
             "SELECT COUNT(*) FROM target_preferences WHERE selected=TRUE"))
-    assert n == 2
-    assert after >= start + 2
+        rejects = int(await con.fetchval(
+            "SELECT COUNT(*) FROM ui_audit_log "
+            "WHERE action='prefs.select' AND outcome='rejected'"))
+    # Exactly one won; exactly one stale_version audit was recorded.
+    assert n_sel == 1
+    assert after == start + 1
+    assert rejects == 1

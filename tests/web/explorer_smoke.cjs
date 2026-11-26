@@ -18,6 +18,14 @@ const settle=()=>new Promise(r=>setTimeout(r,25));
 async function search(text){const input=get('#graph-search');input.value=text;input.oninput({target:input});const buttons=get('#graph-results').children;assert.equal(buttons.length,1);buttons[0].onclick();await settle()}
 (async()=>{
  await settle();assert.match(get('#graph-summary').textContent,/1 чатів/);
+ // Empty-space drag rotates the globe; Shift-drag remains available for panning.
+ const canvas=get('#graph');
+ canvas.onpointerdown({clientX:900,clientY:400,pointerId:1,shiftKey:false});
+ canvas.onpointermove({clientX:600,clientY:700,pointerId:1});
+ canvas.onpointerup({pointerId:1});
+ canvas.onpointerdown({clientX:900,clientY:400,pointerId:2,shiftKey:true});
+ canvas.onpointermove({clientX:930,clientY:420,pointerId:2});
+ canvas.onpointerup({pointerId:2});
  await search('Test chat');assert.match(get('#graph-summary').textContent,/2 авторів/);
  await search('Alice');assert.match(get('#graph-summary').textContent,/1 повідомлень/);
  // Other authors must be absent from the focused level, not merely dimmed.

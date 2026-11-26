@@ -4,6 +4,9 @@ sys.path.insert(0, r"E:\TGParser")
 os.chdir(r"E:\TGParser")
 import asyncpg
 from tgparser.config import load as cfg_load
+# Chat to watch is supplied at run time; no real chat ids live in the repo.
+WATCH_CHAT_ID = int(os.environ["TGPARSER_WATCH_CHAT_ID"])
+
 
 async def main(out_path):
     cfg = cfg_load()
@@ -25,11 +28,11 @@ async def main(out_path):
         }
         ss = await conn.fetchrow(
             "SELECT backfill_status, last_backfilled_message_id, batches_completed "
-            "FROM sync_state WHERE chat_id=-1001000000001")
+            f"FROM sync_state WHERE chat_id={WATCH_CHAT_ID}")
         tick["sync"] = dict(ss) if ss else None
         cp = await conn.fetchrow(
             "SELECT coordinator_heartbeat_at, batch_running, consecutive_batch_failures, "
-            "last_batch_added FROM coordinator_progress WHERE chat_id=-1001000000001")
+            f"last_batch_added FROM coordinator_progress WHERE chat_id={WATCH_CHAT_ID}")
         if cp:
             cp = dict(cp)
             cp["coordinator_heartbeat_at"] = cp["coordinator_heartbeat_at"].isoformat() if cp["coordinator_heartbeat_at"] else None

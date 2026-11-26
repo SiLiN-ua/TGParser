@@ -1,208 +1,128 @@
 # TGParser
 
-24/7 Telegram OSINT collector:
+Локальний колектор Telegram-даних для OSINT-досліджень. Він збирає повідомлення, медіа та профілі з чатів і каналів, які ви обрали у власному Telegram-акаунті. Усе зберігається у вашому PostgreSQL. Для керування та аналізу є локальний веб-інтерфейс.
 
-- Durable, resumable backfill with per-message retry + dead-letter queue
-- Canonical chat ids (via `telethon.utils.get_peer_id`)
-- FloodWait-tolerant iterator that resumes from checkpoint, not restarts
-- PostgreSQL storage with versioned migrations, transparent reconnect/retry
-- Media download queue with dedup, many-to-many (`message_media`), retries, disk-space guard
-- User profile TTL + change history + avatar history by `photo_file_id`
-- Reactions aggregates + authors (admin-only in most chats) with rate-limited queue
-- Memberships: initial sync + live join/leave with `is_complete`/`limitation_reason`
-- Deletions: stub rows when `chat_id` is known, `deletion_events` log when not
-- Background tasks are tracked, awaited on shutdown, errors recorded
-- Per-process lock file (single instance per session)
-- Health check reports `healthy`/`degraded`/`unhealthy` with PID, uptime, PG/TG status
+> ⚠️ **Приватність і закон.** TGParser зберігає персональні дані: імена, @username, повідомлення та медіа. Збирайте лише ті дані, на обробку яких маєте законну підставу. Дотримуйтеся GDPR та місцевого законодавства, а також [умов Telegram API](https://core.telegram.org/api/terms). Не публікуйте зібрані дані, дампи бази, session-файл і `.env`. Використовуйте окремий акаунт Telegram.
 
-## Install
+## Можливості
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+- **Керування джерелами з UI.**
+  - Можна додати чат за `@username`, посиланням `t.me/...`, інвайтом `+HASH` або `chat_id`.
+  - Кнопка «Синхронізувати чати» підтягує нові діалоги з вашого акаунта.
+  - Непотрібні чати можна видалити з платформи.
+  - Для збору можна обрати конкретні чати або взяти всі.
+- **Цілодобовий збір.**
+  - Нові повідомлення надходять у реальному часі.
+  - Історія довантажується паралельно, з контрольними точками та відновленням після збою.
+  - Повідомлення, які не вдалося зберегти, повторюються, а після кількох невдач потрапляють у dead-letter чергу.
+- **Медіа.**
+  - Окрема черга завантаження з дедуплікацією.
+  - Медіа прив'язуються до повідомлень зв'язком «багато-до-багатьох».
+  - Є захист від переповнення диска (backpressure).
+- **Профілі користувачів.** Історія змін профілю та аватарів, ідентичність через пріоритети `access_hash`.
+- **Реакції, членство, видалення та редагування.** Кожна версія повідомлення зберігається окремо.
+- **Admin UI** (FastAPI, `127.0.0.1`).
+  - Командний центр, пошук повідомлень, користувачі, медіа, помилки.
+  - Усі дії, що змінюють дані, доступні лише з localhost.
+  - Кожна така дія вимагає CSRF-токен і точної перевірки `Origin` та атомарно записується в `ui_audit_log`.
+- **Граф зв'язків.**
+  - 3D-сфера рівнів «чати → автори → повідомлення».
+  - Зв'язки будуються за відповідями та пересиланнями.
+- **Admin CLI** (`python -m tgparser.admin`): gate динамічних цілей, налаштування, discovery, підтвердження масового зникнення.
+- **Один процес на сесію.** Файловий lock гарантує, що session-файл Telegram ніколи не відкриють два клієнти одночасно.
 
-Postgres 17 locally (one-time setup); keep the DB user to `localhost` until you
-rotate the password, then move it to a non-trivial secret in `.env` before
-opening the port on the network.
+## Скріншоти
 
-## Config
+> Частину даних на знімках замазано.
 
-Secrets in `.env` (never committed):
+| Командний центр | Граф: чати |
+|---|---|
+| ![Командний центр](docs/screenshots/dashboard.png) | ![Граф чатів](docs/screenshots/graph-chats.png) |
 
-```
-TG_API_ID=...
-TG_API_HASH=...
-TG_PHONE=+7...
-TG_SESSION_NAME=tgparser
-PG_DSN=postgresql://tgparser:<pw>@127.0.0.1:5432/tgparser
-```
+| Граф: розгорнутий рівень | Граф: повідомлення автора |
+|---|---|
+| ![Повний граф](docs/screenshots/graph-full.png) | ![Повідомлення](docs/screenshots/graph-messages.png) |
 
-Runtime in `config.yaml`:
+## Встановлення (Linux)
 
-```yaml
-storage:
-  media_dir: "./media"
-  download_media: true
-  max_media_mb: 500
-  media_concurrency: 3
-targets:
-  - "@durov"
-options:
-  backfill_on_start: true
-  backfill_limit: null                  # null = full history
-  follow_linked_discussion: true
-  user_profile_ttl_hours: 24
-  reaction_authors: false
-  reaction_authors_limit: 100
-  reaction_authors_concurrency: 2
-  participants_sync: true
-  per_message_retries: 3
-  bg_concurrency: 10
-```
-
-## Run
-
-```powershell
-.\.venv\Scripts\python.exe run.py
-```
-
-First launch prompts for QR scan (`login_qr.png`) + 2FA. Session saved to
-`tgparser.session`.
-
-Health snapshot (exit 0 = healthy, 1 = degraded, 2 = unhealthy):
-
-```powershell
-.\.venv\Scripts\python.exe health.py
-```
-
-Tests:
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-## 24/7 (Windows, user scope — no admin)
-
-```powershell
-.\scripts\install_task.ps1          # elevated; registers a proper /SC ONLOGON task
-```
-
-User-scope variant (no admin required) is scripted explicitly:
-
-```powershell
-schtasks /Create /TN "TGParser" `
-  /TR "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\Users\<you>\Desktop\TGParser\scripts\ensure_running.ps1`"" `
-  /SC DAILY /ST 00:01 /RI 1 /DU 24:00 /F
-
-$startup = [Environment]::GetFolderPath("Startup")
-$lnk = Join-Path $startup "TGParser.lnk"
-$ws = New-Object -ComObject WScript.Shell
-$s = $ws.CreateShortcut($lnk)
-$s.TargetPath = "powershell.exe"
-$s.Arguments  = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\Users\<you>\Desktop\TGParser\scripts\ensure_running.ps1`""
-$s.WorkingDirectory = "C:\Users\<you>\Desktop\TGParser"
-$s.WindowStyle = 7
-$s.Save()
-```
-
-`ensure_running.ps1` is a watchdog: it starts `pythonw.exe run.py` only when
-the lock file is stale or missing, so repeated invocations never create a
-second instance. The Startup shortcut handles login-time start; the scheduled
-task repeats every minute as a crash-restart mechanism.
-
-## 24/7 (Linux systemd)
-
-`/etc/systemd/system/tgparser.service`:
-
-```ini
-[Unit]
-Description=TGParser
-After=network.target postgresql.service
-Wants=postgresql.service
-
-[Service]
-Type=simple
-User=tgparser
-WorkingDirectory=/opt/tgparser
-EnvironmentFile=/opt/tgparser/.env
-ExecStart=/opt/tgparser/.venv/bin/python run.py
-Restart=always
-RestartSec=10
-TimeoutStopSec=30
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
+Вимоги: Python 3.11+ і PostgreSQL 17.
 
 ```bash
-sudo systemctl enable --now tgparser
-journalctl -u tgparser -f
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-web.txt
+cp .env.example .env              # заповніть локально, НЕ комітьте
+cp config.yaml.example config.yaml
 ```
 
-## Backups
+Створіть роль і базу в PostgreSQL. Пароль придумайте сильний, і він має збігатися з тим, що вказано в `PG_DSN`:
 
-```powershell
-$ts = Get-Date -Format "yyyyMMdd_HHmmss"
-$bk = "C:\backups\tgparser_$ts"
-New-Item -ItemType Directory -Path $bk -Force | Out-Null
-$env:PGPASSWORD="<pw>"
-& "C:\Program Files\PostgreSQL\17\bin\pg_dump.exe" -U tgparser -h 127.0.0.1 -d tgparser -F c -f "$bk\tgparser.dump"
-Copy-Item .\tgparser.session "$bk\"
-# media/ grows large — sync separately (robocopy / rsync).
+```bash
+sudo -u postgres createuser -P tgparser
+sudo -u postgres createdb -O tgparser tgparser
 ```
 
-## Data model (v3)
+Міграції застосовуються автоматично під час першого запуску. Також можна скористатися скриптом `setup_linux.sh`.
 
-| table | purpose |
+### Секрети (`.env`)
+
+| Змінна | Опис |
 |---|---|
-| `chats` | canonical chat records, `linked_chat_id`, `is_forum` |
-| `users` | profile + `full_fetched_at` TTL + `user_profile_history` change log |
-| `avatar_history` | one row per (`user_id`, `photo_file_id`) with `local_path` |
-| `memberships` | join/leave/role events, `source` = initial_sync/chat_action |
-| `sync_state` | per-chat `last_backfilled_message_id`, `participants_synced`/`_is_complete`/`_limitation` |
-| `messages` | `(chat_id, message_id)` canonical, all metadata + `raw` JSONB |
-| `message_versions` | every observed version, deduped by `(chat_id, message_id, edit_date)` |
-| `message_media` | many-to-many: one Telegram file can attach to many messages |
-| `media` | one row per `file_id` with status pending/done/skipped/failed, attempts |
-| `message_reactions` | aggregate counts per emoji |
-| `message_reaction_authors` | per-peer authors (admin-only in many chats) |
-| `backfill_queue` | durable retry for messages that failed in backfill; blocks checkpoint |
-| `deletion_events` | append-only log of `UpdateDeleteMessages` without a `chat_id` |
-| `chat_actions` | ChatAction events (join/leave/pin/rename…) |
-| `errors` | isolated collector exceptions with traceback |
-| `runtime_state` | pid / status / targets / started_at / heartbeat_at |
+| `TG_API_ID`, `TG_API_HASH` | ключі застосунку з <https://my.telegram.org> |
+| `TG_PHONE` | номер акаунта, потрібен лише для входу |
+| `TG_SESSION_NAME` | ім'я локального session-файлу |
+| `PG_DSN` | `postgresql://USER:PASSWORD@127.0.0.1:5432/DB` |
 
-## Durability guarantees
+Файли `.env`, `config.yaml`, `*.session`, `media/`, `logs/` і бекапи виключені з git у `.gitignore`.
 
-- Backfill checkpoint `last_backfilled_message_id` is NEVER advanced past any
-  message currently `pending` in `backfill_queue` (tested in
-  `tests/test_collector_flow.py::test_backfill_dlq_then_recovery`).
-- Per-message failures are retried 3 times by default, then dead-lettered.
-- `retry_dead_letter` is invoked once after each backfill pass and re-fetches
-  each failed message by id.
-- On process restart, `MediaQueue.sweep_retryable()` re-enqueues every
-  `pending`/`failed` row that still has a `(chat_id, message_id)` pointer.
-- A FloodWait in the middle of `iter_messages` sleeps then re-opens the
-  iterator from the live checkpoint; the current message is retried.
-- Transient Postgres connection errors are retried with exponential backoff and
-  trigger a pool recreate (tested by terminating all backends mid-op).
+## Запуск
 
-## Telegram API limitations
+```bash
+.venv/bin/python run.py                       # колектор; перший запуск: вхід за QR + 2FA
+.venv/bin/python health.py                    # стан: 0 healthy, 1 degraded, 2 unhealthy
+.venv/bin/python -m uvicorn web.app:app --host 127.0.0.1 --port 8080   # веб-інтерфейс
+.venv/bin/python -m tgparser.sync_once        # одноразова синхронізація діалогів, коли колектор зупинено
+.venv/bin/python -m tgparser.admin status     # Admin CLI
+```
 
-- **Full membership lists** for big private groups are capped by Telegram
-  (~10k) and may require admin; recorded in `sync_state.participants_limitation`.
-- **Reaction authors** are hidden in channels and many groups unless you're
-  admin, and are rate-limited with pagination.
-- **Historical edits or deletions** that happened before we were observing are
-  not retrievable.
-- **`UpdateDeleteMessages` without `chat_id`**: Telegram sometimes sends these;
-  we log the ids to `deletion_events` but cannot associate them with rows.
-- **Private chats you're not in**: no way, by anyone.
-- **`bio`**: depends on each user's privacy setting; `null` is a valid answer.
-- **Historical profile changes** before first observation are lost; only
-  changes seen after the collector started appear in `user_profile_history`.
-- **Hard bans**: aggressive polling or scraping may still get the session
-  banned. Use a dedicated number.
+Шаблони systemd user-юнітів лежать у `deploy/`. Перед використанням виправте в них шляхи під своє розташування проєкту. Автозапуск вмикайте лише свідомо.
+
+### Як працює синхронізація чатів
+
+1. Додайте канали, групи або чати у своєму Telegram-акаунті.
+2. У веб-інтерфейсі натисніть «Синхронізувати чати».
+   - Якщо колектор працює, запит виконає основний процес.
+   - Якщо колектор зупинено, ненадовго запуститься `tgparser.sync_once` із тим самим lock-файлом. Веб-процес ніколи сам не відкриває Telegram-сесію.
+3. Позначте потрібні чати й натисніть «Запустити збір».
+
+## Тести
+
+Тести створюють тимчасові бази в PostgreSQL, тому потрібен робочий `PG_DSN` до локального сервера. До Telegram тести не звертаються.
+
+```bash
+.venv/bin/python -m pytest -q                 # усі тести
+.venv/bin/python -m pytest -q tests/web       # веб-інтерфейс
+node tests/web/explorer_smoke.cjs             # smoke-тест графа (Node.js)
+```
+
+## Структура
+
+| Шлях | Призначення |
+|---|---|
+| `tgparser/` | колектор, сховище, динамічні цілі, черга медіа, Admin CLI |
+| `web/` | FastAPI-інтерфейс: шаблони, статика, керування |
+| `migrations/` | версіоновані SQL-міграції схеми |
+| `tests/` | pytest та JS smoke-тести |
+| `scripts/` | діагностичні та звітні утиліти, читають секрети лише з `.env` |
+| `deploy/` | шаблони systemd-юнітів |
+| `docs/` | документація та скріншоти |
+
+## Обмеження Telegram API
+
+- Повний список учасників великих груп обмежений Telegram, і для його отримання може знадобитися статус адміністратора.
+- Автори реакцій здебільшого видимі лише адміністраторам.
+- Редагування та видалення, які сталися до початку спостереження, отримати неможливо.
+- Агресивний збір може призвести до блокування акаунта. Використовуйте окремий номер.
+
+## Ліцензія
+
+Ліцензію ще не обрано. Поки її не додано, усі права належать автору.

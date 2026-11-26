@@ -1,6 +1,6 @@
 # Idempotent watchdog: start TGParser if not already running.
 # Safe to invoke every minute from Task Scheduler.
-$proj = "C:\Users\<user>\Desktop\TGParser"
+$proj = Split-Path -Parent $PSScriptRoot   # repo root = parent of scripts/
 $lock = Join-Path $proj "tgparser.lock"
 $py   = Join-Path $proj ".venv\Scripts\pythonw.exe"
 if (-not (Test-Path $py)) {

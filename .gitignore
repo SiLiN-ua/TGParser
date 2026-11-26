@@ -28,3 +28,27 @@ _robocopy_media.log
 reports/_*
 reports/*.tsv
 _report_data.json
+
+# --- security hygiene: never commit local data, secrets or diagnostics ---
+!.env.example
+*.env
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+*.sqlite
+*.sqlite3
+*.db
+*.backup
+*.bak
+*.sql.gz
+/*.sql
+dumps/
+sessions/
+downloads/
+*.log
+diag_*.json
+*_report_data*.json
+design/mockups/
+tgparser.session*

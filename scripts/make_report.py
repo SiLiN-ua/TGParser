@@ -24,6 +24,9 @@ from pathlib import Path
 
 import asyncpg
 from dotenv import load_dotenv
+# Chat to watch is supplied at run time; no real chat ids live in the repo.
+REPORT_CHAT_ID = int(os.environ["TGPARSER_REPORT_CHAT_ID"])
+
 
 
 HERE = Path(__file__).resolve().parent.parent
@@ -100,7 +103,7 @@ async def collect() -> dict:
             # Replaced with a type label to avoid leaking the invite hash.
             target_rows.append({
                 "chat_id": r["chat_id"],
-                "kind": "supergroup" if r["chat_id"] == -1001000000001 else "channel",
+                "kind": "supergroup" if r["chat_id"] == REPORT_CHAT_ID else "channel",
                 "backfill_status": r["backfill_status"],
                 "pending_count": r["pending_count"],
                 "dead_count": r["dead_count"],
@@ -129,8 +132,8 @@ async def collect() -> dict:
                 EXTRACT(EPOCH FROM (collected_at - date))::int AS lag_sec,
                 EXTRACT(EPOCH FROM (NOW() - collected_at))::int AS seen_age
                 FROM messages
-                WHERE chat_id=-1001000000001 AND text IS NOT NULL
-                ORDER BY message_id DESC LIMIT 5"""):
+                WHERE chat_id=$1 AND text IS NOT NULL
+                ORDER BY message_id DESC LIMIT 5""", REPORT_CHAT_ID):
             live.append({
                 "message_id": r["message_id"],
                 "anon_user": _anon_pid(r["sender_user_id"]) if r["sender_user_id"] else "channel",
@@ -675,7 +678,7 @@ def render_html(snap: dict) -> str:
         return "\n".join(f"<li>{html.escape(x)}</li>" for x in xs)
 
     batches_this_pid = sum(s["batches_completed"] for s in snap["sync_state"]
-                           if s["chat_id"] == -1001000000001)
+                           if s["chat_id"] == REPORT_CHAT_ID)
 
     return HTML_TEMPLATE.format(
         generated_at=snap["generated_at"],

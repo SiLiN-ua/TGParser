@@ -27,3 +27,4 @@ reports/*.json
 _robocopy_media.log
 reports/_*
 reports/*.tsv
+_report_data.json

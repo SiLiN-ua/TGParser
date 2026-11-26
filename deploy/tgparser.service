@@ -1,0 +1,37 @@
+[Unit]
+Description=TGParser — 24/7 Telegram OSINT collector (user scope)
+Documentation=https://github.com/
+# Wait for the network to be reachable. We do NOT depend on postgresql here
+# because that's a system-level unit the user may not manage; connection
+# failures are retried by TGParser's own exponential backoff.
+After=network-online.target
+# Rate-limit crash loops: after 5 failed starts within 300s, systemd stops
+# trying until the next daemon-reload or reset-failed.
+# (StartLimit* directives live in [Unit], not [Service].)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/Desktop/Work/TGParser
+# Secrets (API_ID/API_HASH/PG_DSN/phone) are read from .env, not placed in
+# this unit file. .env must be chmod 600.
+EnvironmentFile=/home/user/Desktop/Work/TGParser/.env
+ExecStart=/home/user/Desktop/Work/TGParser/.venv/bin/python run.py
+
+# Restart policy: only on failure (SIGINT-initiated exits return 0 and MUST
+# NOT be auto-restarted; systemctl restart/stop is explicit).
+Restart=on-failure
+RestartSec=15
+# The shutdown path is bounded at ~15s; give it a bit more headroom before
+# SIGKILL kicks in.
+TimeoutStopSec=30
+# Our collector catches SIGINT, runs the ordered teardown, writes
+# runtime_state='stopped' at the very end and exits 0.
+KillSignal=SIGINT
+# Exit 0 is a clean stop; 130 is the SIGINT-interrupted convention some
+# Python versions use when the KeyboardInterrupt path isn't taken.
+SuccessExitStatus=0 130
+
+[Install]
+WantedBy=default.target

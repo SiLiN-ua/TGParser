@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Файл</h1>
+<p class="mono muted">{{ d.file_id }}</p>
+
+<section class="cards small">
+  <div class="card"><div class="k">Статус</div><div class="v"><span class="tag s-{{ d.status }}">{{ d.status }}</span></div></div>
+  <div class="card"><div class="k">Тип</div><div class="v">{{ d.media_type or '—' }}</div></div>
+  <div class="card"><div class="k">MIME</div><div class="v">{{ d.mime_type or '—' }}</div></div>
+  <div class="card"><div class="k">Розмір</div><div class="v">{{ d.size|nice_int if d.size else '—' }}</div></div>
+  <div class="card"><div class="k">Роздільність</div><div class="v">{% if d.width and d.height %}{{ d.width }}×{{ d.height }}{% else %}—{% endif %}</div></div>
+  <div class="card"><div class="k">Тривалість</div><div class="v">{% if d.duration %}{{ d.duration }} с{% else %}—{% endif %}</div></div>
+  <div class="card"><div class="k">Вперше</div><div class="v">{{ d.first_seen|kyiv }}</div></div>
+  <div class="card"><div class="k">Завантажено</div><div class="v">{{ d.completed_at|kyiv or '—' }}</div></div>
+</section>
+
+{% if d.status == 'done' and d.local_path %}
+<section>
+<h2>Вміст</h2>
+{% set mt = d.media_type %}
+{% if mt in ('photo','image','sticker') %}
+  <img class="preview" alt="" src="/media/raw/{{ d.file_id|urlencode }}">
+{% elif mt == 'video' %}
+  <video class="preview" controls preload="metadata" src="/media/raw/{{ d.file_id|urlencode }}"></video>
+{% elif mt in ('audio','voice') %}
+  <audio class="preview" controls preload="metadata" src="/media/raw/{{ d.file_id|urlencode }}"></audio>
+{% else %}
+  <p><a class="btn" href="/media/raw/{{ d.file_id|urlencode }}">Завантажити</a></p>
+{% endif %}
+</section>
+{% elif d.last_error %}
+<section>
+<h2>Помилка завантаження</h2>
+<pre class="raw">{{ d.last_error }}</pre>
+</section>
+{% endif %}
+
+<section>
+<h2>Джерело</h2>
+<p>Чат <span class="mono">{{ d.chat_id or '—' }}</span>, повідомлення <span class="mono">{{ d.message_id or '—' }}</span>
+  {% if d.chat_id and d.message_id %}· <a href="/messages/{{ d.chat_id }}/{{ d.message_id }}">перейти</a>{% endif %}
+</p>
+{% if d.sha256 %}<p class="mono muted">sha256: {{ d.sha256 }}</p>{% endif %}
+</section>
+{% endblock %}

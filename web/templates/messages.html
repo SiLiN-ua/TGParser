@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Повідомлення</h1>
+<form class="filters" method="get" action="/messages">
+  <label>Пошук у тексті<input type="text" name="q" value="{{ q }}" maxlength="200" placeholder="слово або фраза"></label>
+  <label>Chat ID<input type="text" name="chat_id" value="{{ chat_id }}" maxlength="32" inputmode="numeric"></label>
+  <label>Sender ID<input type="text" name="sender" value="{{ sender }}" maxlength="32" inputmode="numeric"></label>
+  <label>Від<input type="date" name="date_from" value="{{ date_from }}"></label>
+  <label>До<input type="date" name="date_to" value="{{ date_to }}"></label>
+  <label>З медіа
+    <select name="with_media">
+      <option value="">—</option>
+      <option value="1" {% if with_media=='1' %}selected{% endif %}>Так</option>
+      <option value="0" {% if with_media=='0' %}selected{% endif %}>Ні</option>
+    </select>
+  </label>
+  <label class="chk"><input type="checkbox" name="only_deleted" value="1" {% if only_deleted=='1' %}checked{% endif %}> Видалені</label>
+  <button type="submit">Знайти</button>
+  <a class="btn" href="/messages">Скинути</a>
+</form>
+
+{% if rows %}
+<table class="tbl cards-on-mobile">
+  <thead><tr><th>Дата</th><th>Чат</th><th>ID</th><th>Відправник</th><th>Текст</th><th>Медіа</th><th>Статус</th></tr></thead>
+  <tbody>
+  {% for m in rows %}
+    <tr>
+      <td class="mono" data-h="Дата">{{ m.date|kyiv }}</td>
+      <td data-h="Чат">{{ m.chat_title or 'Невідомий чат' }}<small class="muted"> {{ m.chat_id }}</small></td>
+      <td class="mono" data-h="ID"><a href="/messages/{{ m.chat_id }}/{{ m.message_id }}">#{{ m.message_id }}</a>{% if telegram_link(m.chat_id,m.message_id) %}<br><a target="_blank" rel="noopener noreferrer" href="{{ telegram_link(m.chat_id,m.message_id) }}">Telegram</a>{% endif %}</td>
+      <td class="mono" data-h="Відправник">{% if m.sender_user_id %}<a href="/users/{{ m.sender_user_id }}">{{ m.sender_user_id }}</a>{% else %}—{% endif %}</td>
+      <td data-h="Текст">{{ m.text_preview }}</td>
+      <td data-h="Медіа">{{ m.media_type or '' }}</td>
+      <td data-h="Статус">{% if m.is_deleted %}<span class="tag bad">видалено</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if next_cursor %}
+<p class="pager"><a class="btn" href="?q={{ q|urlencode }}&chat_id={{ chat_id|urlencode }}&sender={{ sender|urlencode }}&date_from={{ date_from|urlencode }}&date_to={{ date_to|urlencode }}&with_media={{ with_media|urlencode }}&only_deleted={{ only_deleted|urlencode }}&cursor={{ next_cursor|urlencode }}">Наступна сторінка</a></p>
+{% endif %}
+{% else %}
+<p class="muted">Нічого не знайдено.</p>
+{% endif %}
+{% endblock %}

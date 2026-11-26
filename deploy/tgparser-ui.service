@@ -1,0 +1,26 @@
+[Unit]
+Description=TGParser UI — read-only local web panel
+Documentation=https://github.com/
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/Desktop/Work/TGParser
+# UI reads only the DSN from .env. For the production UI service, consider
+# creating a tgparser_ui role with CONNECT/USAGE/SELECT only and pointing
+# UI_PG_DSN at it (also readable from .env via an added UI_PG_DSN= line).
+EnvironmentFile=/home/user/Desktop/Work/TGParser/.env
+# Bind strictly to loopback — no exposure outside this machine.
+Environment=UI_HOST=127.0.0.1
+Environment=UI_PORT=8080
+ExecStart=/home/user/Desktop/Work/TGParser/.venv/bin/python -m uvicorn \
+    web.app:app --host 127.0.0.1 --port 8080 \
+    --no-access-log --no-server-header --log-level info \
+    --workers 1
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

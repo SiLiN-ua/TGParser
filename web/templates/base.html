@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{ title }} · TGParser</title>
+<link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=20261126-purple-final">
+</head>
+<body>
+{% set path = request.url.path %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="TGParser, головна">
+      <span class="brand-mark" aria-hidden="true">T</span>
+      <span><strong>TGParser</strong><small>Local intelligence</small></span>
+    </a>
+    <div class="nav-label">Огляд</div>
+    <nav class="nav" aria-label="Основна навігація">
+      <a href="/graph">Граф зв’язків</a>
+      <a href="/" class="{% if path == '/' %}active{% endif %}"><span class="nav-icon">⌂</span>Командний центр</a>
+      <a href="/messages" class="{% if path.startswith('/messages') %}active{% endif %}"><span class="nav-icon">≡</span>Повідомлення</a>
+      <a href="/users" class="{% if path.startswith('/users') %}active{% endif %}"><span class="nav-icon">◎</span>Користувачі</a>
+    </nav>
+    <div class="nav-label">Дані</div>
+    <nav class="nav" aria-label="Дані">
+      <a href="/media" class="{% if path.startswith('/media') %}active{% endif %}"><span class="nav-icon">▧</span>Медіа</a>
+      <a href="/chats" class="{% if path.startswith('/chats') %}active{% endif %}"><span class="nav-icon">◇</span>Чати</a>
+      <a href="/errors" class="{% if path.startswith('/errors') %}active{% endif %}"><span class="nav-icon">!</span>Помилки</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="privacy-dot"></span>
+      <span>Локальне керування<br><small>127.0.0.1 · лише цей ПК</small></span>
+    </div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <form class="global-search" action="/messages" method="get" role="search">
+        <span aria-hidden="true">⌕</span>
+        <input name="q" type="search" maxlength="200" placeholder="Пошук у повідомленнях">
+      </form>
+      <div class="top-meta"><span class="timezone">Europe/Kyiv</span><span class="readonly">local control</span></div>
+    </header>
+    <main class="main">{% block content %}{% endblock %}</main>
+    <footer class="foot">TGParser · локальна аналітична консоль</footer>
+  </div>
+</div>
+<script src="{{ url_for('static', path='app.js') }}" defer></script>
+</body>
+</html>

@@ -6,6 +6,9 @@ config.yaml
 media/
 logs/
 backup_*/
+restore_safety_backups/
+*.dump
+PostgreSQL/
 tgparser.lock
 login_qr.png
 __pycache__/
@@ -19,3 +22,8 @@ healthwatch_out.json
 out.json
 reports/*.html
 reports/*.json
+
+# local run artifacts (may hold collected data or local usernames)
+_robocopy_media.log
+reports/_*
+reports/*.tsv

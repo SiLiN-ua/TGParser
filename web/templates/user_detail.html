@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block content %}
+{% set u = d.user %}
+<h1>{% if u.username %}@{{ u.username }}{% else %}{{ u.first_name or '' }} {{ u.last_name or '' }}{% endif %} <span class="mono muted">#{{ u.id }}</span></h1>
+
+<section class="cards small">
+  <div class="card"><div class="k">ID</div><div class="v mono">{{ u.id }}</div></div>
+  {% if u.username %}<div class="card"><div class="k">Username</div><div class="v">@{{ u.username }}</div></div>{% endif %}
+  {% if u.phone %}<div class="card"><div class="k">Телефон</div><div class="v mono">{{ u.phone }}</div></div>{% endif %}
+  <div class="card"><div class="k">Ім’я</div><div class="v">{{ u.first_name or '' }} {{ u.last_name or '' }}</div></div>
+  <div class="card"><div class="k">Мова</div><div class="v">{{ u.lang_code or '—' }}</div></div>
+  <div class="card"><div class="k">Якість запису</div><div class="v">{{ u.entity_quality or '—' }} · {{ u.entity_source or '' }}</div></div>
+  <div class="card"><div class="k">Профіль отримано</div><div class="v">{{ u.full_fetched_at|kyiv or '—' }}</div></div>
+  <div class="card"><div class="k">Востаннє був у мережі</div><div class="v">{{ u.last_seen|kyiv or '—' }}</div></div>
+</section>
+
+<section>
+<h2>Позначки</h2>
+<p>
+  {% for f, name in [('is_bot','бот'),('is_premium','premium'),('is_verified','verified'),('is_scam','scam'),('is_fake','fake'),('is_deleted','видалений'),('is_contact','контакт'),('is_mutual_contact','взаємний'),('is_close_friend','близький'),('is_min','min')] %}
+    {% if u[f] %}<span class="tag{% if f in ('is_scam','is_fake','is_deleted') %} bad{% endif %}">{{ name }}</span>{% endif %}
+  {% endfor %}
+</p>
+{% if u.bio %}<h3>Біо</h3><div class="text-block">{{ u.bio }}</div>{% endif %}
+</section>
+
+{% if d.avatars %}
+<section>
+<h2>Аватари</h2>
+<ul class="meta">
+  {% for a in d.avatars %}
+  <li class="mono">{{ a.first_seen|kyiv }} · photo_file_id={{ a.photo_file_id }}</li>
+  {% endfor %}
+</ul>
+</section>
+{% endif %}
+
+{% if d.history %}
+<section>
+<h2>Історія профілю</h2>
+<table class="tbl">
+<thead><tr><th>Коли</th><th>Поле</th><th>Було</th><th>Стало</th></tr></thead>
+<tbody>
+{% for h in d.history %}
+<tr>
+  <td class="mono">{{ h.changed_at|kyiv }}</td>
+  <td>{{ h.field }}</td>
+  <td>{{ h.old_value|short(120) }}</td>
+  <td>{{ h.new_value|short(120) }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+{% if d.messages %}
+<section>
+<h2>Останні повідомлення</h2>
+<table class="tbl">
+<thead><tr><th>Дата</th><th>Чат</th><th>ID</th><th>Текст</th></tr></thead>
+<tbody>
+{% for m in d.messages %}
+<tr>
+  <td class="mono">{{ m.date|kyiv }}</td>
+  <td>{{ m.chat_title or 'Невідомий чат' }}</td>
+  <td class="mono"><a href="/messages/{{ m.chat_id }}/{{ m.message_id }}">#{{ m.message_id }}</a>{% if telegram_link(m.chat_id,m.message_id) %}<br><a target="_blank" rel="noopener noreferrer" href="{{ telegram_link(m.chat_id,m.message_id) }}">Telegram</a>{% endif %}</td>
+  <td>{{ m.text_preview }}{% if m.media_type %} <span class="muted">[{{ m.media_type }}]</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+{% if d.observations %}
+<section>
+<h2>Спостереження</h2>
+<table class="tbl">
+<thead><tr><th>Коли</th><th>Чат</th><th>Повідомл.</th><th>Джерело</th><th>Якість</th><th>Як показано</th></tr></thead>
+<tbody>
+{% for o in d.observations %}
+<tr>
+  <td class="mono">{{ o.observed_at|kyiv }}</td>
+  <td>{{ o.chat_title or 'Невідомий чат' }}</td>
+  <td class="mono">{{ o.message_id or '—' }}</td>
+  <td>{{ o.source_type or '' }}</td>
+  <td>{{ o.entity_quality or '' }}</td>
+  <td>{{ o.display_name_at_time or '' }}{% if o.username_at_time %} <span class="muted">@{{ o.username_at_time }}</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+{% endblock %}

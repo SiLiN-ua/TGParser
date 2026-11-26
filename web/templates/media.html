@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Медіа</h1>
+<form class="filters" method="get" action="/media">
+  <label>Статус
+    <select name="status">
+      <option value="">—</option>
+      {% for s in ['pending','done','failed','skipped','metadata_only','needs_refresh','unavailable'] %}
+        <option value="{{ s }}" {% if status==s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Тип
+    <select name="media_type">
+      <option value="">—</option>
+      {% for t in ['photo','video','audio','voice','document','sticker','image'] %}
+        <option value="{{ t }}" {% if media_type==t %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Від<input type="date" name="date_from" value="{{ date_from }}"></label>
+  <label>До<input type="date" name="date_to" value="{{ date_to }}"></label>
+  <button type="submit">Знайти</button>
+  <a class="btn" href="/media">Скинути</a>
+</form>
+
+{% if rows %}
+<table class="tbl cards-on-mobile">
+<thead><tr><th>Перегляд</th><th>file_id</th><th>Тип</th><th>Статус</th><th>Розмір</th><th>Вперше</th></tr></thead>
+<tbody>
+{% for m in rows %}
+<tr>
+  <td data-h="Перегляд">
+    {% if m.status == 'done' and m.media_type in ('photo','image','sticker') %}
+      <img class="thumb" loading="lazy" alt="" src="/media/raw/{{ m.file_id|urlencode }}">
+    {% else %}
+      <span class="muted">—</span>
+    {% endif %}
+  </td>
+  <td data-h="file_id" class="mono"><a href="/media/f/{{ m.file_id|urlencode }}">{{ m.file_id|short(40) }}</a></td>
+  <td data-h="Тип">{{ m.media_type or '—' }}</td>
+  <td data-h="Статус"><span class="tag s-{{ m.status }}">{{ m.status }}</span></td>
+  <td data-h="Розмір" class="r">{{ m.size|nice_int if m.size else '—' }}</td>
+  <td data-h="Вперше" class="mono">{{ m.first_seen|kyiv }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% if next_cursor %}
+<p class="pager"><a class="btn" href="?status={{ status|urlencode }}&media_type={{ media_type|urlencode }}&date_from={{ date_from|urlencode }}&date_to={{ date_to|urlencode }}&cursor={{ next_cursor|urlencode }}">Наступна сторінка</a></p>
+{% endif %}
+{% else %}
+<p class="muted">Файлів не знайдено.</p>
+{% endif %}
+{% endblock %}

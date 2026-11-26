@@ -2463,6 +2463,108 @@ class Storage:
                 return {"ok": True, "confirmed_version": policy_version}
 
     @_with_db_retry()
+    async def admin_delete_chat(self, *, chat_id: int, actor: str,
+                                action: str, detail: dict) -> dict:
+        """Hard-delete a chat from the UI picker, atomically with an audit.
+
+        Safety: refuses if the chat has any collected messages — a chat with
+        data has to be handled explicitly by the operator (it is not a mere
+        picker-visibility mistake). For an empty chat the method:
+
+        * UPSERTs ``target_preferences(excluded=TRUE, selected=FALSE)`` so
+          the chat acts as a blocklist entry — the next discovery sweep
+          will still write the dialog back into ``discovered_dialogs`` (we
+          cannot stop iter_dialogs), but the picker query filters excluded
+          rows out by default.
+        * DELETEs the chat's rows from ``discovered_dialogs``,
+          ``sync_state``, ``target_state`` and ``coordinator_progress`` so
+          the UI stops showing the chat right away.
+
+        Returns a result dict; on refusal (messages present), audit is
+        ``rejected`` and the DELETEs are not performed.
+        """
+        cid = int(chat_id)
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    "SELECT id FROM policy_state WHERE id=1 FOR UPDATE")
+                msgs = int(await con.fetchval(
+                    "SELECT COUNT(*) FROM messages WHERE chat_id=$1", cid))
+                if msgs > 0:
+                    await self._admin_audit(
+                        con, actor, action, "rejected",
+                        {**detail, "reason": "has_messages",
+                         "count": msgs, "status_code": 409})
+                    return {"ok": False, "reason": "has_messages",
+                            "messages": msgs, "chat_id": cid}
+                # Blocklist marker first, so even if the DELETEs are later
+                # racing with an in-flight discovery publish, the row that
+                # survives marks the chat as excluded.
+                await con.execute(
+                    "INSERT INTO target_preferences "
+                    "  (chat_id, selected, excluded, note, updated_at, updated_by) "
+                    "VALUES ($1, FALSE, TRUE, $3, NOW(), $2) "
+                    "ON CONFLICT (chat_id) DO UPDATE SET "
+                    "  selected=FALSE, excluded=TRUE, "
+                    "  note=COALESCE(target_preferences.note, $3), "
+                    "  updated_at=NOW(), updated_by=$2",
+                    cid, actor[:80], "ui delete")
+                await con.execute(
+                    "DELETE FROM discovered_dialogs WHERE chat_id=$1", cid)
+                await con.execute(
+                    "DELETE FROM sync_state WHERE chat_id=$1", cid)
+                await con.execute(
+                    "DELETE FROM target_state WHERE chat_id=$1", cid)
+                await con.execute(
+                    "DELETE FROM coordinator_progress WHERE chat_id=$1", cid)
+                await self._admin_audit(
+                    con, actor, action, "ok",
+                    {**detail, "status_code": 200, "count": 1})
+                return {"ok": True, "chat_id": cid}
+
+    @_with_db_retry()
+    async def admin_add_yaml_import(self, *, raw_target: str, actor: str,
+                                    action: str, detail: dict) -> dict:
+        """Atomic: INSERT (or no-op) into yaml_target_imports + audit in one
+        tx. Idempotent: on conflict with an existing row we never resurrect
+        a terminal status — we return its current state. The main process's
+        resolver loop (dynamic.resolve_yaml) will pick up pending/retry rows
+        the next time the TelegramClient is online."""
+        t = self._yaml_target(raw_target)
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                existing = await con.fetchrow(
+                    "SELECT id, status, resolved_chat_id, last_error_class, "
+                    "       attempts, created_at "
+                    "FROM yaml_target_imports WHERE raw_target=$1 FOR UPDATE",
+                    t)
+                if existing is None:
+                    rid = int(await con.fetchval(
+                        "INSERT INTO yaml_target_imports (raw_target) "
+                        "VALUES ($1) RETURNING id", t))
+                    status = "pending"
+                    inserted = True
+                    resolved = None
+                else:
+                    rid = int(existing["id"])
+                    status = existing["status"]
+                    inserted = False
+                    resolved = existing["resolved_chat_id"]
+                    if status in ("terminal", "retry"):
+                        # An explicit operator re-add means "try again now"
+                        # (e.g. the account has since joined the chat).
+                        await con.execute(
+                            "UPDATE yaml_target_imports SET status='pending', "
+                            "  attempts=0, next_retry_at=NULL, last_error_class=NULL "
+                            "WHERE id=$1", rid)
+                        status = "pending"
+                await self._admin_audit(con, actor, action, "ok",
+                                        {**detail, "count": 1 if inserted else 0,
+                                         "status_code": 201 if inserted else 200})
+                return {"ok": True, "inserted": inserted, "id": rid,
+                        "status": status, "resolved_chat_id": resolved}
+
+    @_with_db_retry()
     async def admin_request_discovery(self, *, actor: str, action: str,
                                       detail: dict) -> dict:
         """Atomic: discovery request + audit. Refuses if a pending request is

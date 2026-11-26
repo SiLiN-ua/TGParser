@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Користувачі</h1>
+<form class="filters" method="get" action="/users">
+  <label>Пошук<input type="text" name="q" value="{{ q }}" maxlength="200" placeholder="id, username, ім’я або телефон"></label>
+  <button type="submit">Знайти</button>
+  <a class="btn" href="/users">Скинути</a>
+</form>
+
+{% if rows %}
+<table class="tbl cards-on-mobile">
+<thead><tr><th>ID</th><th>Username</th><th>Ім’я</th><th>Позначки</th><th>Останнє оновлення</th></tr></thead>
+<tbody>
+{% for u in rows %}
+<tr>
+  <td class="mono" data-h="ID"><a href="/users/{{ u.id }}">{{ u.id }}</a></td>
+  <td class="mono" data-h="Username">{% if u.username %}@{{ u.username }}{% endif %}</td>
+  <td data-h="Ім’я">{{ u.first_name or '' }} {{ u.last_name or '' }}</td>
+  <td data-h="Позначки">
+    {% if u.is_bot %}<span class="tag">бот</span>{% endif %}
+    {% if u.is_premium %}<span class="tag">premium</span>{% endif %}
+    {% if u.is_verified %}<span class="tag">✓</span>{% endif %}
+    {% if u.is_scam %}<span class="tag bad">scam</span>{% endif %}
+    {% if u.is_fake %}<span class="tag bad">fake</span>{% endif %}
+    {% if u.is_deleted %}<span class="tag bad">видалений</span>{% endif %}
+  </td>
+  <td data-h="Оновлено">{{ u.last_updated|kyiv }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% if next_cursor %}
+<p class="pager"><a class="btn" href="?q={{ q|urlencode }}&cursor={{ next_cursor|urlencode }}">Наступна сторінка</a></p>
+{% endif %}
+{% else %}
+<p class="muted">Користувачів не знайдено.</p>
+{% endif %}
+{% endblock %}

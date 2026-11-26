@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+{% set m = d.msg %}
+<h1>Повідомлення #{{ m.message_id }}</h1>
+<p class="muted">Чат <span>{{ m.chat_title or m.chat_id }}</span> · {{ m.date|kyiv }}{% if m.edit_date %} · редакція {{ m.edit_date|kyiv }}{% endif %}{% if m.is_deleted %} · <span class="tag bad">видалено</span>{% endif %}</p>
+
+{% if telegram_link(m.chat_id,m.message_id) %}<p><a href="{{ telegram_link(m.chat_id,m.message_id) }}">Відкрити в Telegram</a></p>{% endif %}
+<section class="card">
+  <div class="k">Відправник</div>
+  <div class="v">{% if m.sender_user_id %}<a href="/users/{{ m.sender_user_id }}">{{ m.sender_name or m.sender_user_id }}</a>{% elif m.sender_chat_id %}канал {{ m.sender_chat_id }}{% else %}—{% endif %}</div>
+</section>
+
+{% if m.reply_to_message_id %}
+<section class="card"><div class="k">Відповідь на</div><div class="v"><a href="/messages/{{ m.reply_to_peer_id or m.chat_id }}/{{ m.reply_to_message_id }}">#{{ m.reply_to_message_id }}</a>{% if m.thread_id %} · потік {{ m.thread_id }}{% endif %}</div></section>
+{% endif %}
+
+{% if m.fwd_from_chat_id or m.fwd_from_user_id or m.fwd_from_name %}
+<section class="card"><div class="k">Переслано від</div>
+<div class="v">
+  {% if m.fwd_from_user_id %}<a href="/users/{{ m.fwd_from_user_id }}">{{ m.fwd_from_user_id }}</a>{% endif %}
+  {% if m.fwd_from_chat_id %}чат {{ m.fwd_from_chat_id }}{% endif %}
+  {% if m.fwd_from_name %}{{ m.fwd_from_name }}{% endif %}
+  {% if m.fwd_from_msg_id %}· сообщ. {{ m.fwd_from_msg_id }}{% endif %}
+  {% if m.fwd_date %}· {{ m.fwd_date|kyiv }}{% endif %}
+</div></section>
+{% endif %}
+
+<section>
+<h2>Текст</h2>
+<div class="text-block">{{ m.text if m.text else '(порожньо)' }}</div>
+</section>
+
+{% if d.media %}
+<section>
+<h2>Медіа</h2>
+<table class="tbl">
+<thead><tr><th>Тип</th><th>Статус</th><th>Розмір</th><th>Файл</th></tr></thead>
+<tbody>
+{% for f in d.media %}
+<tr>
+  <td>{{ f.media_type or '—' }}</td>
+  <td><span class="tag s-{{ f.status }}">{{ f.status or '—' }}</span></td>
+  <td class="r">{{ f.size|nice_int if f.size else '—' }}</td>
+  <td><a href="/media/f/{{ f.file_id }}">{{ f.file_id }}</a></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+{% if d.reactions %}
+<section>
+<h2>Реакції</h2>
+<ul class="reactions">
+{% for r in d.reactions %}
+  <li><span class="emoji">{{ r.reaction }}</span> <strong>{{ r.count|nice_int }}</strong></li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+{% if d.versions %}
+<section>
+<h2>Версії редагувань</h2>
+<ol class="versions">
+{% for v in d.versions %}
+  <li>
+    <div class="muted">{{ v.captured_at|kyiv }}{% if v.edit_date %} · edit {{ v.edit_date|kyiv }}{% endif %}{% if v.is_initial %} · початкова{% endif %}</div>
+    <div class="text-block">{{ v.text if v.text else '(порожньо)' }}</div>
+  </li>
+{% endfor %}
+</ol>
+</section>
+{% endif %}
+
+<section>
+<h2>Метрики</h2>
+<ul class="meta">
+  {% if m.views %}<li>Перегляди: {{ m.views|nice_int }}</li>{% endif %}
+  {% if m.forwards %}<li>Репости: {{ m.forwards|nice_int }}</li>{% endif %}
+  {% if m.replies_count %}<li>Відповіді: {{ m.replies_count|nice_int }}</li>{% endif %}
+  {% if m.reactions_total %}<li>Усього реакцій: {{ m.reactions_total|nice_int }}</li>{% endif %}
+  <li>collected_at: {{ m.collected_at|kyiv }}</li>
+</ul>
+</section>
+
+<details>
+  <summary>raw (JSON)</summary>
+  <pre class="raw">{{ m.raw|pretty_json }}</pre>
+</details>
+{% endblock %}

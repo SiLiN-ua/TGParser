@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Чати / цілі</h1>
+{% if targets %}
+<table class="tbl">
+<thead><tr><th>Чат</th><th>Назва</th><th>Backfill</th><th>Чекпойнт</th><th>Учасники</th><th>Увімкнено</th><th>Останній успіх</th></tr></thead>
+<tbody>
+{% for t in targets %}
+<tr>
+  <td class="mono">{{ t.chat_id }}</td>
+  <td>{{ t.title or '—' }}{% if t.username %} <span class="muted">@{{ t.username }}</span>{% endif %}<br><span class="muted mono">{{ t.target }}</span></td>
+  <td><span class="tag s-{{ t.backfill_status }}">{{ t.backfill_status or '—' }}</span></td>
+  <td class="mono">{{ t.last_backfilled_message_id|nice_int if t.last_backfilled_message_id is not none else '—' }}</td>
+  <td>{% if t.participants_is_complete %}повний{% elif t.participants_synced %}частковий{% else %}—{% endif %}
+    {% if t.participants_limitation %}<div class="muted">{{ t.participants_limitation|short(120) }}</div>{% endif %}
+  </td>
+  <td>{{ 'так' if t.enabled else 'ні' }}</td>
+  <td class="mono">{{ t.last_success_at|kyiv or '—' }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="muted">Цілей немає.</p>
+{% endif %}
+{% endblock %}

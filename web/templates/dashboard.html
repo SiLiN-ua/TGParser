@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% block content %}
+{% set r = data.runtime %}
+<div class="page-head">
+  <div><p class="eyebrow">Огляд системи</p><h1>Командний центр</h1><p class="subtitle">Стан колектора та накопичених даних в одному місці.</p></div>
+  <span class="state-badge {% if r and r.status in ('syncing','healthy') %}is-live{% elif r and r.status == 'stopped' %}is-paused{% else %}is-alert{% endif %}">
+    <i></i>{{ 'Збір активний' if r and r.status in ('syncing','healthy') else ('Збір зупинено' if r and r.status == 'stopped' else 'Потребує уваги') }}
+  </span>
+</div>
+
+<section class="hero-grid">
+  <article class="service-panel">
+    <div class="panel-top"><span class="kicker">tgparser.service</span><span class="mono">PID {{ r.pid if r and r.pid else '—' }}</span></div>
+    <div class="service-state">{{ 'Збір зупинено' if r and r.status == 'stopped' else (r.status if r else 'Немає даних') }}</div>
+    <p>{% if r and r.status == 'stopped' %}Службу штатно зупинено. Дані доступні для перегляду, нові повідомлення не збираються.{% else %}Колектор підключений і обробляє потік Telegram.{% endif %}</p>
+    <div class="health-row">
+      <span><i class="{% if r and r.heartbeat_at %}ok-dot{% endif %}"></i>PostgreSQL <b>{{ r.heartbeat_at|kyiv if r and r.heartbeat_at else 'немає heartbeat' }}</b></span>
+      <span>Telegram <b>{{ 'підключено' if r and r.pid and r.status in ('syncing','healthy') and r.telegram_connected else 'немає активного підключення' }}</b></span>
+    </div>
+  </article>
+  <article class="metric-card accent"><span>Повідомлень</span><strong>{{ data.totals.messages|nice_int }}</strong><small>{{ data.msgs_per_min|nice_int }} за останню хвилину</small></article>
+  <article class="metric-card"><span>Медіа</span><strong>{{ data.totals.media|nice_int }}</strong><small>файлів у каталозі</small></article>
+</section>
+
+<section class="collector-control" data-token="{{ control_token }}"
+         data-service-running="{{ 'true' if r and r.pid and r.status in ('syncing','healthy') else 'false' }}">
+  <div class="control-copy">
+    <p class="eyebrow">Керування збором</p>
+    <h2>Запустити парсер</h2>
+    <p>Додавайте нові чати, оновлюйте список із Telegram та вмикайте лише обрані цілі. Автозапуск не вмикається.</p>
+  </div>
+
+  <div class="sources-bar">
+    <form id="add-chat-form" class="add-chat" autocomplete="off">
+      <label for="add-chat-input">Додати чат</label>
+      <input type="text" id="add-chat-input" name="raw_target"
+             placeholder="@username, https://t.me/…, +HASH або chat_id"
+             maxlength="300" spellcheck="false" required>
+      <button type="submit" id="add-chat-btn">Додати</button>
+    </form>
+    <div class="sync-chats">
+      <button type="button" id="sync-chats-btn">Синхронізувати чати</button>
+      <span class="muted" id="sync-chats-hint"></span>
+    </div>
+  </div>
+  <p id="sources-result" class="sources-result" role="status" aria-live="polite"></p>
+
+  <div class="control-modes" role="radiogroup" aria-label="Режим збору">
+    <label><input type="radio" name="collector-mode" value="all"> Усі відомі чати <span>{{ control_chats|length }}</span></label>
+    <label><input type="radio" name="collector-mode" value="selected" checked> Обрані чати</label>
+  </div>
+
+  <div class="picker-toolbar">
+    <input type="search" id="chat-search" placeholder="Пошук за назвою або @username…"
+           aria-label="Пошук чатів" maxlength="120">
+    <div class="picker-filters" role="tablist" aria-label="Фільтри">
+      <button type="button" data-filter="all"       class="is-active" role="tab" aria-selected="true">Усі</button>
+      <button type="button" data-filter="channel"   role="tab" aria-selected="false">Канали</button>
+      <button type="button" data-filter="group"     role="tab" aria-selected="false">Групи</button>
+      <button type="button" data-filter="selected"  role="tab" aria-selected="false">Обрані</button>
+    </div>
+    <div class="picker-bulk">
+      <button type="button" id="picker-select-visible">Обрати всі видимі</button>
+      <button type="button" id="picker-clear">Зняти вибір</button>
+      <span id="picker-count" class="muted" aria-live="polite">0 обрано</span>
+    </div>
+  </div>
+
+  <div class="chat-picker" id="chat-picker">
+    {% for c in control_chats %}
+    <label class="chat-option"
+           data-id="{{ c.id }}"
+           data-type="{{ c.type or 'chat' }}"
+           data-title="{{ (c.title or '')|e }}"
+           data-username="{{ (c.username or '')|e }}"
+           data-enabled="{{ 'true' if c.enabled else 'false' }}"
+           data-selected="{{ 'true' if c.selected else 'false' }}">
+      <input type="checkbox" value="{{ c.id }}" {% if c.selected %}checked{% endif %}>
+      <span class="chat-main">
+        <strong>{{ c.title or c.username or ('Чат ' ~ c.id) }}</strong>
+        <small>
+          {% if c.username %}<span class="chat-username">@{{ c.username }}</span> · {% endif %}
+          <span class="chat-type">{{ c.type or 'chat' }}</span> ·
+          {{ c.messages|nice_int }} повідомлень
+        </small>
+      </span>
+      <span class="chat-badges">
+        {% set svc_live = r and r.pid and r.status in ('syncing','healthy') %}
+        {% if c.enabled and svc_live %}<span class="chip chip-live">збирається</span>
+        {% elif c.enabled %}<span class="chip chip-active">активна (пауза)</span>
+        {% elif c.selected %}<span class="chip chip-selected">обрано</span>
+        {% else %}<span class="chip chip-idle">не обрано</span>{% endif %}
+        {% if c.gone %}<span class="chip chip-gone">зник</span>{% endif %}
+        {% if c.archived %}<span class="chip chip-archived">архів</span>{% endif %}
+      </span>
+      <code class="chat-id">{{ c.id }}</code>
+      <button type="button" class="chat-row-btn chat-delete"
+              data-chat-id="{{ c.id }}"
+              title="Видалити з платформи" aria-label="Видалити з платформи">×</button>
+    </label>
+    {% else %}<p class="muted" id="picker-empty">Доступних чатів поки немає. Додайте перший через «Додати чат» або «Синхронізувати чати».</p>{% endfor %}
+  </div>
+
+  <div class="control-actions">
+    <button type="button" id="collector-start">Запустити збір</button>
+    <button type="button" id="collector-stop" class="danger-button">Зупинити</button>
+    <span id="collector-result" role="status" aria-live="polite"></span>
+  </div>
+</section>
+
+<section class="stats-strip">
+  <div><span>Користувачі</span><b>{{ data.totals.users|nice_int }}</b></div>
+  <div><span>Чати</span><b>{{ data.totals.chats|nice_int }}</b></div>
+  <div><span>Версії редагувань</span><b>{{ data.totals.versions|nice_int }}</b></div>
+  <div><span>Реакції</span><b>{{ data.totals.reactions|nice_int }}</b></div>
+  <div class="{% if data.totals.dlq_dead %}danger-text{% endif %}"><span>DLQ</span><b>{{ data.totals.dlq_pending|nice_int }} / {{ data.totals.dlq_dead|nice_int }}</b></div>
+</section>
+
+<div class="section-head"><div><p class="eyebrow">Сховище</p><h2>Медіа за статусом</h2></div><a href="/media" class="text-link">Відкрити каталог</a></div>
+<table class="tbl">
+  <thead><tr><th>Статус</th><th class="r">Файлів</th></tr></thead>
+  <tbody>
+    {% for row in data.media_status %}
+    <tr>
+      <td><span class="tag s-{{ row.status }}">{{ row.status }}</span></td>
+      <td class="r">{{ row.n|nice_int }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="section-head"><div><p class="eyebrow">Збір</p><h2>Активні цілі</h2></div><a href="/chats" class="text-link">Усі чати</a></div>
+<table class="tbl">
+  <thead><tr><th>Чат</th><th>Назва</th><th>Backfill</th><th>Чекпойнт</th><th class="r">pending</th><th class="r">dead</th><th>Учасники</th></tr></thead>
+  <tbody>
+    {% for t in data.targets %}
+    <tr>
+      <td class="mono">{{ t.chat_id }}</td>
+      <td>{{ t.title or '—' }}{% if t.username %} <span class="muted">@{{ t.username }}</span>{% endif %}</td>
+      <td><span class="tag s-{{ t.backfill_status }}">{{ t.backfill_status or '—' }}</span></td>
+      <td class="mono">{{ t.last_backfilled_message_id|nice_int if t.last_backfilled_message_id is not none else '—' }}</td>
+      <td class="r">{{ t.pending_count|nice_int if t.pending_count is not none else 0 }}</td>
+      <td class="r">{{ t.dead_count|nice_int if t.dead_count is not none else 0 }}</td>
+      <td>
+        {% if t.participants_is_complete %}повний{% elif t.participants_synced %}частковий{% else %}—{% endif %}
+        {% if t.participants_limitation %}<div class="muted">{{ t.participants_limitation|short(60) }}</div>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="section-head"><div><p class="eyebrow">Динаміка</p><h2>Повідомлення за 24 години</h2></div><span class="muted">Europe/Kyiv</span></div>
+<div class="chart" data-chart='{{ chart|tojson }}' aria-label="Графік повідомлень за 24 години"></div>
+
+<div class="section-head"><div><p class="eyebrow">Діагностика</p><h2>Останні помилки</h2></div><a href="/errors" class="text-link">Журнал помилок</a></div>
+{% if data.errors %}
+<table class="tbl">
+  <thead><tr><th>Час</th><th>Група</th><th>Чат / Повідомлення</th><th>Повідомлення</th><th>Вирішено</th></tr></thead>
+  <tbody>
+  {% for e in data.errors %}
+    <tr>
+      <td class="mono">{{ e.at|kyiv }}</td>
+      <td>{{ e.error_group or e.kind or '—' }}</td>
+      <td class="mono">{{ e.chat_id or '—' }} / {{ e.message_id or '—' }}</td>
+      <td>{{ e.message|short(200) }}</td>
+      <td>{{ e.resolved_at|kyiv if e.resolved_at else '' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Помилок немає.</p>
+{% endif %}
+{% endblock %}
